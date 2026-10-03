@@ -46,7 +46,8 @@ Output gain defaults to +12 dB for both playback and WAV exports. Use `-gain`
 to adjust it, for example `./adlmidi song.mid -gain 6`, or `-gain 0` for no
 output boost. The range is -60 to +30 dB. Soft peak limiting protects loud
 passages, and reverb adds ambience while preserving the direct instrument sound.
-Use `-nr` to disable reverb.
+Reverb gain defaults to +24 dB; use `-reverb gain=18` to reduce its level,
+or `-nr` to disable reverb.
 
 Playback uses the terminal's alternate screen with a black background and fixed
 RGB colours. Metadata, the single puzzle board, and notes have separate areas.

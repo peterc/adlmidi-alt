@@ -2762,13 +2762,13 @@ static union ReverbSpecs
     struct byname
     {
         float do_reverb    = 1.0f; // boolean...
-        float wet_gain_db  = 6.0f; // wet_gain_dB  (-10..10)
+        float wet_gain_db  = 24.0f; // Wet signal gain in dB
         float room_scale   = 0.7f; // room_scale   (0..1)
         float reverberance = 0.6f; // reverberance (0..1)
         float hf_damping   = 0.8f; // hf_damping   (0..1)
         float pre_delay_s  = 0.f;   // pre_delay_s  (0.. 0.5)
         float stereo_depth = 1.f;   // stereo_depth (0..1)
-    } byname = {1.f, 6.f, .7f, .6f, .8f, 0.f, 1.f};
+    } byname = {1.f, 24.f, .7f, .6f, .8f, 0.f, 1.f};
 } ReverbSpecs;
 static struct MyReverbData
 {
@@ -3526,7 +3526,7 @@ int main(int argc, char** argv)
             " -game           Show the puzzle game (disabled by default)\n"
             " -no-game        Hide the puzzle game\n"
 #ifndef __DJGPP__
-            " -reverb <specs> Controls reverb (default: gain=6:room=.7:factor=.6:damping=.8:predelay=0:stereo=1)\n"
+            " -reverb <specs> Controls reverb (default: gain=24:room=.7:factor=.6:damping=.8:predelay=0:stereo=1)\n"
             " -reverb none    Disables reverb (also -nr)\n"
             " -gain <dB>      Output gain in dB (-60..30, default: 12)\n"
 #endif
