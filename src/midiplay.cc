@@ -2993,7 +2993,9 @@ static std::deque<short> AudioBuffer;
 static MutexType AudioBuffer_lock;
 static void AdlAudioCallback(void*, Uint8* stream, int len)
 {
-    SDL_LockAudio();
+    // SDL does not require the supplied buffer to contain silence already.
+    // Always initialize the tail if the producer has not queued enough audio.
+    std::memset(stream, 0, len);
     short* target = (short*) stream;
     AudioBuffer_lock.Lock();
     /*if(len != AudioBuffer.size())
@@ -3006,7 +3008,6 @@ static void AdlAudioCallback(void*, Uint8* stream, int len)
     AudioBuffer.erase(AudioBuffer.begin(), AudioBuffer.begin() + ate);
     //fprintf(stderr, " - remain %u\n", (unsigned) AudioBuffer.size()/2);
     AudioBuffer_lock.Unlock();
-    SDL_UnlockAudio();
 }
 #endif // WIN32
 
@@ -3044,18 +3045,11 @@ static void SendStereoAudio(unsigned long count, int* samples)
 #endif
     if(!count) return;
 
-    // Attempt to filter out the DC component. However, avoid doing
-    // sudden changes to the offset, for it can be audible.
+    // Average is used only for the level meters. DC is removed per sample below.
     double average[2]={0,0};
     for(unsigned w=0; w<2; ++w)
         for(unsigned long p = 0; p < count; ++p)
             average[w] += samples[p*2+w];
-    static float prev_avg_flt[2] = {0,0};
-    float average_flt[2] =
-    {
-        prev_avg_flt[0] = (prev_avg_flt[0] + average[0]*0.04/double(count)) / 1.04,
-        prev_avg_flt[1] = (prev_avg_flt[1] + average[1]*0.04/double(count)) / 1.04
-    };
     // Figure out the amplitude of both channels
     if(!DoingInstrumentTesting)
     {
@@ -3096,11 +3090,10 @@ static void SendStereoAudio(unsigned long count, int* samples)
     for(unsigned w=0; w<2; ++w)
     {
         dry[w].resize(count);
-        float a = average_flt[w];
         for(unsigned long p = 0; p < count; ++p)
         {
             int   s = samples[p*2+w];
-            dry[w][p] = (s - a) * double(0.3/32768.0);
+            dry[w][p] = s * double(0.3/32768.0);
         }
         // ^  Note: ftree-vectorize causes an error in this loop on g++-4.4.5
         reverb_data.chan[w].input_fifo.insert(
@@ -3120,6 +3113,9 @@ static void SendStereoAudio(unsigned long count, int* samples)
     size_t pos = AudioBuffer.size();
     AudioBuffer.resize(pos + count*2);
 #endif
+    // A continuous 5 Hz high-pass removes DC without block-boundary steps.
+    static float previous_input[2] = {0,0}, previous_output[2] = {0,0};
+    static const float dc_pole = std::exp(-2.0 * 3.141592653589793 * 5.0 / PCM_RATE);
     for(unsigned long p = 0; p < count; ++p)
         for(unsigned w=0; w<2; ++w)
         {
@@ -3127,8 +3123,11 @@ static void SendStereoAudio(unsigned long count, int* samples)
                           reverb_data.wetonly * (
                 .5 * (reverb_data.chan[0].out[w][p]
                     + reverb_data.chan[1].out[w][p]))
-                        ) * 32768.0f
-                 + average_flt[w];
+                        ) * 32768.0f;
+            float filtered = out - previous_input[w] + dc_pole * previous_output[w];
+            previous_input[w] = out;
+            previous_output[w] = filtered;
+            out = filtered;
             AudioBuffer[pos+p*2+w] =
                 out<-32768.f ? -32768 :
                 out>32767.f ?  32767 : out;
