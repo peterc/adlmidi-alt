@@ -20,6 +20,7 @@
 #include <ctime>
 #include <memory>
 #include <chrono>
+#include <atomic>
 
 #include <assert.h>
 
@@ -69,7 +70,8 @@ static bool HighVibratoMode   = false;
 static bool AdlPercussionMode = false;
 static bool LogarithmicVolumes = false;
 static bool CartoonersVolumes = false;
-static bool QuitFlag = false, FakeDOSshell = false;
+static volatile sig_atomic_t QuitFlag = false;
+static bool FakeDOSshell = false;
 static unsigned SkipForward = 0;
 static bool DoingInstrumentTesting = false;
 static bool QuitWithoutLooping = false;
@@ -2991,6 +2993,9 @@ namespace WindowsAudio
 #else
 static std::deque<short> AudioBuffer;
 static MutexType AudioBuffer_lock;
+static constexpr unsigned StopFadeFrames = PCM_RATE / 50; // 20 ms
+static std::atomic<bool> AudioStopping{false};
+static std::atomic<unsigned> StopFadeRemaining{0};
 static void AdlAudioCallback(void*, Uint8* stream, int len)
 {
     // SDL does not require the supplied buffer to contain silence already.
@@ -3006,6 +3011,18 @@ static void AdlAudioCallback(void*, Uint8* stream, int len)
     for(unsigned a=0; a<ate; ++a)
         target[a] = AudioBuffer[a];
     AudioBuffer.erase(AudioBuffer.begin(), AudioBuffer.begin() + ate);
+    if(AudioStopping.load())
+    {
+        unsigned remaining = StopFadeRemaining.load();
+        for(unsigned frame=0; frame<unsigned(len)/4; ++frame)
+        {
+            float gain = remaining / float(StopFadeFrames);
+            target[frame*2]   *= gain;
+            target[frame*2+1] *= gain;
+            if(remaining) --remaining;
+        }
+        StopFadeRemaining.store(remaining);
+    }
     //fprintf(stderr, " - remain %u\n", (unsigned) AudioBuffer.size()/2);
     AudioBuffer_lock.Unlock();
 }
@@ -3385,11 +3402,8 @@ public:
 
 static void TidyupAndExit(int)
 {
-    UI.EndScreen();
-    Input.Restore();
-    std::fflush(stderr);
-    signal(SIGINT, SIG_DFL);
-    raise(SIGINT);
+    // Let the playback loop fade and close audio, then restore the terminal.
+    QuitFlag = true;
 }
 
 #ifdef __WIN32__
@@ -3859,6 +3873,18 @@ int main(int argc, char** argv)
 #ifdef __WIN32__
     WindowsAudio::Close();
 #else
+    if(!WritePCMfile)
+    {
+        StopFadeRemaining.store(StopFadeFrames);
+        AudioStopping.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while(StopFadeRemaining.load() && std::chrono::steady_clock::now() < deadline)
+            SDL_Delay(1);
+        // The callback fills a buffer ahead of the speakers. Allow the faded
+        // buffer to play before closing the device and discarding queued audio.
+        if(!StopFadeRemaining.load() && obtained.freq > 0)
+            SDL_Delay(std::min(100u, 1000u * obtained.samples / obtained.freq + 10u));
+    }
     SDL_CloseAudio();
 #endif
 
