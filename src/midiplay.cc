@@ -76,6 +76,7 @@ static unsigned SkipForward = 0;
 static bool DoingInstrumentTesting = false;
 static bool QuitWithoutLooping = false;
 static bool ShowPuzzleGame = false;
+static double OutputGainDb = 12.0;
 static bool WritePCMfile = false;
 static std::string PCMfilepath = "adlmidi.wav";
 #ifdef SUPPORT_VIDEO_OUTPUT
@@ -2771,7 +2772,7 @@ static union ReverbSpecs
 } ReverbSpecs;
 static struct MyReverbData
 {
-    float  wetonly;
+    bool enabled;
     Reverb chan[2];
 
     MyReverbData()
@@ -2780,7 +2781,7 @@ static struct MyReverbData
     }
     void ReInit()
     {
-        wetonly = ReverbSpecs.byname.do_reverb;
+        enabled = ReverbSpecs.byname.do_reverb > 0;
         for(std::size_t i=0; i<2; ++i)
         {
             chan[i].Create(PCM_RATE,
@@ -2860,7 +2861,7 @@ static void ParseReverb(std::string_view specs)
         }
         specs.remove_prefix(colon);
     }
-    std::fprintf(stderr, "Reverb settings: Wet-dry=%g gain=%g room=%g reverb=%g damping=%g delay=%g stereo=%g\n",
+    std::fprintf(stderr, "Reverb settings: Enabled=%g gain=%g room=%g reverb=%g damping=%g delay=%g stereo=%g\n",
         ReverbSpecs.array[0],
         ReverbSpecs.byname.wet_gain_db,
         ReverbSpecs.byname.room_scale,
@@ -3102,24 +3103,30 @@ static void SendStereoAudio(unsigned long count, int* samples)
     return;}
 #endif
 
-    // Convert input to float format
+    // Remove DC before reverb so offsets do not consume its headroom.
+    static float previous_input[2] = {0,0}, previous_output[2] = {0,0};
+    static const float dc_pole = std::exp(-2.0 * 3.141592653589793 * 5.0 / PCM_RATE);
     std::vector<float> dry[2];
     for(unsigned w=0; w<2; ++w)
     {
         dry[w].resize(count);
         for(unsigned long p = 0; p < count; ++p)
         {
-            int   s = samples[p*2+w];
-            dry[w][p] = s * double(0.3/32768.0);
+            float input = samples[p*2+w];
+            float filtered = input - previous_input[w] + dc_pole * previous_output[w];
+            previous_input[w] = input;
+            previous_output[w] = filtered;
+            dry[w][p] = filtered * double(0.3/32768.0);
         }
         // ^  Note: ftree-vectorize causes an error in this loop on g++-4.4.5
-        reverb_data.chan[w].input_fifo.insert(
-        reverb_data.chan[w].input_fifo.end(),
-            dry[w].begin(), dry[w].end());
+        if(reverb_data.enabled)
+            reverb_data.chan[w].input_fifo.insert(
+                reverb_data.chan[w].input_fifo.end(), dry[w].begin(), dry[w].end());
     }
     // Reverbify it
-    for(unsigned w=0; w<2; ++w)
-        reverb_data.chan[w].Process(count);
+    if(reverb_data.enabled)
+        for(unsigned w=0; w<2; ++w)
+            reverb_data.chan[w].Process(count);
 
     // Convert to signed 16-bit int format and put to playback queue
 #ifdef __WIN32__
@@ -3130,25 +3137,38 @@ static void SendStereoAudio(unsigned long count, int* samples)
     size_t pos = AudioBuffer.size();
     AudioBuffer.resize(pos + count*2);
 #endif
-    // A continuous 5 Hz high-pass removes DC without block-boundary steps.
-    static float previous_input[2] = {0,0}, previous_output[2] = {0,0};
-    static const float dc_pole = std::exp(-2.0 * 3.141592653589793 * 5.0 / PCM_RATE);
+    static const float output_gain = std::pow(10.0, OutputGainDb / 20.0);
     for(unsigned long p = 0; p < count; ++p)
+    {
+        float out[2];
         for(unsigned w=0; w<2; ++w)
         {
-            float out = ((1 - reverb_data.wetonly) * dry[w][p] +
-                          reverb_data.wetonly * (
-                .5 * (reverb_data.chan[0].out[w][p]
-                    + reverb_data.chan[1].out[w][p]))
-                        ) * 32768.0f;
-            float filtered = out - previous_input[w] + dc_pole * previous_output[w];
-            previous_input[w] = out;
-            previous_output[w] = filtered;
-            out = filtered;
-            AudioBuffer[pos+p*2+w] =
-                out<-32768.f ? -32768 :
-                out>32767.f ?  32767 : out;
+            // Preserve the direct signal; reverb adds ambience rather than
+            // replacing the instrument with an effect-only signal.
+            float wet = reverb_data.enabled
+                ? .5f * (reverb_data.chan[0].out[w][p] + reverb_data.chan[1].out[w][p])
+                : 0;
+            out[w] = (dry[w][p] + .25f * wet) * output_gain;
         }
+        // Gently limit loud peaks, with the same gain in both channels to
+        // preserve stereo balance. Normal levels remain linear.
+        float peak = std::max(std::fabs(out[0]), std::fabs(out[1]));
+        const float knee = .9f, ceiling = 32766.f / 32768.f;
+        if(peak > knee)
+        {
+            float limited = knee + (ceiling-knee) * std::tanh((peak-knee)/(ceiling-knee));
+            float scale = limited / peak;
+            out[0] *= scale;
+            out[1] *= scale;
+        }
+        for(unsigned w=0; w<2; ++w)
+        {
+            float pcm = out[w] * 32768.f;
+            AudioBuffer[pos+p*2+w] =
+                pcm<-32768.f ? -32768 :
+                pcm>32767.f ?  32767 : pcm;
+        }
+    }
     if(WritePCMfile)
     {
         /* HACK: Cheat on DOSBox recording: Record audio separately on Windows. */
@@ -3508,6 +3528,7 @@ int main(int argc, char** argv)
 #ifndef __DJGPP__
             " -reverb <specs> Controls reverb (default: gain=6:room=.7:factor=.6:damping=.8:predelay=0:stereo=1)\n"
             " -reverb none    Disables reverb (also -nr)\n"
+            " -gain <dB>      Output gain in dB (-60..30, default: 12)\n"
 #endif
             " -w [<filename>] Write WAV file rather than playing\n"
 #ifdef SUPPORT_VIDEO_OUTPUT
@@ -3558,6 +3579,21 @@ int main(int argc, char** argv)
 #ifndef __DJGPP__
         else if(!std::strcmp("-nr", argv[2]))
             ParseReverb("none");
+        else if(!std::strcmp("-gain", argv[2]))
+        {
+            const char* value = argc > 3 ? argv[3] : "";
+            const char* first = (*value == '-' || *value == '+') ? value+1 : value;
+            char* end = nullptr;
+            double gain = std::strtod(value, &end);
+            if(((*first < '0' || *first > '9') && *first != '.')
+                || end == value || *end || gain < -60 || gain > 30)
+            {
+                std::fprintf(stderr, "-gain requires a number in dB between -60 and 30.\n");
+                return 1;
+            }
+            OutputGainDb = gain;
+            had_option = true;
+        }
         else if(!std::strcmp("-reverb", argv[2]))
         {
             ParseReverb(argv[3]);

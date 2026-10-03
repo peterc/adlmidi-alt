@@ -42,6 +42,12 @@ The puzzle game is disabled by default. To enable it:
 
 Press `q`, Escape, or Ctrl-C to stop playback and restore the terminal.
 
+Output gain defaults to +12 dB for both playback and WAV exports. Use `-gain`
+to adjust it, for example `./adlmidi song.mid -gain 6`, or `-gain 0` for no
+output boost. The range is -60 to +30 dB. Soft peak limiting protects loud
+passages, and reverb adds ambience while preserving the direct instrument sound.
+Use `-nr` to disable reverb.
+
 Playback uses the terminal's alternate screen with a black background and fixed
 RGB colours. Metadata, the single puzzle board, and notes have separate areas.
 Each MIDI channel has an instrument label beside its notes. Track/instrument
@@ -67,6 +73,7 @@ Usage: adlmidi <midifilename> [ <options> ] [ <banknumber> [ <numcards> [ <numfo
  -nl Quit without looping
  -game Show the puzzle game (disabled by default)
  -no-game Hide the puzzle game
+ -gain <dB> Output gain in dB (-60..30, default: 12)
  -w Write WAV file rather than playing
     Banks: 0 = AIL (Star Control 3, Albion, Empire 2, Sensible Soccer, Settlers 2, many others)
            1 = Bisqwit (selection of 4op and 2op)
