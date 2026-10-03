@@ -18,6 +18,7 @@
 #include <deque>  // deque
 #include <cmath>  // exp, log, ceil
 #include <ctime>
+#include <memory>
 
 #include <assert.h>
 
@@ -71,6 +72,7 @@ static bool QuitFlag = false, FakeDOSshell = false;
 static unsigned SkipForward = 0;
 static bool DoingInstrumentTesting = false;
 static bool QuitWithoutLooping = false;
+static bool ShowPuzzleGame = true;
 static bool WritePCMfile = false;
 static std::string PCMfilepath = "adlmidi.wav";
 #ifdef SUPPORT_VIDEO_OUTPUT
@@ -80,17 +82,23 @@ static bool WriteVideoFile = false;
 
 static bool ScaleModulators = false;
 static unsigned WindowLines = 0;
+static unsigned WindowColumns = 80;
+static volatile sig_atomic_t WindowResized = 0;
+static bool TerminalActive = false;
 static bool WritingToTTY;
 
 static unsigned WinHeight()
 {
+    // MIDI rows and the puzzle layout are independent of the emulated chip count.
+    if(TerminalActive)
+        return WindowLines ? std::min(54u, std::max(2u, WindowLines)-1) : 36u;
     unsigned result =
         AdlPercussionMode
         ? std::min(2u, NumCards) * 23
         : std::min(3u, NumCards) * 18;
 
-    if(WindowLines) result = std::min(WindowLines-1, result);
-    return result;
+    if(WindowLines) result = std::min(std::max(2u, WindowLines)-1, result);
+    return std::max(1u, result);
 }
 
 #if (!defined(__WIN32__) || defined(__CYGWIN__)) && defined(TIOCGWINSZ)
@@ -99,7 +107,11 @@ static void SigWinchHandler(int)
 {
     struct winsize w;
     if(ioctl(2, TIOCGWINSZ, &w) >= 0 || ioctl(1, TIOCGWINSZ, &w) >= 0 || ioctl(0, TIOCGWINSZ, &w) >= 0)
-        WindowLines = w.ws_row;
+    {
+        if(w.ws_row) WindowLines = w.ws_row;
+        if(w.ws_col) WindowColumns = w.ws_col;
+        WindowResized = 1;
+    }
 }
 #else
 static void SigWinchHandler(int) {}
@@ -213,6 +225,42 @@ static const char MIDIsymbols[256+1] =
 "????????????????"  // Prc 96-111
 "????????????????"; // Prc 112-127
 
+static const char* const GMNames[128] =
+{
+    "Grand Piano", "Bright Piano", "Electric Grand", "Honky-tonk Piano",
+    "Electric Piano 1", "Electric Piano 2", "Harpsichord", "Clavinet",
+    "Celesta", "Glockenspiel", "Music Box", "Vibraphone",
+    "Marimba", "Xylophone", "Tubular Bells", "Dulcimer",
+    "Drawbar Organ", "Percussive Organ", "Rock Organ", "Church Organ",
+    "Reed Organ", "Accordion", "Harmonica", "Tango Accordion",
+    "Nylon Guitar", "Steel Guitar", "Jazz Guitar", "Clean Guitar",
+    "Muted Guitar", "Overdrive Guitar", "Distortion Guitar", "Guitar Harmonics",
+    "Acoustic Bass", "Fingered Bass", "Picked Bass", "Fretless Bass",
+    "Slap Bass 1", "Slap Bass 2", "Synth Bass 1", "Synth Bass 2",
+    "Violin", "Viola", "Cello", "Contrabass",
+    "Tremolo Strings", "Pizzicato Strings", "Harp", "Timpani",
+    "Strings 1", "Strings 2", "Synth Strings 1", "Synth Strings 2",
+    "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit",
+    "Trumpet", "Trombone", "Tuba", "Muted Trumpet",
+    "French Horn", "Brass Section", "Synth Brass 1", "Synth Brass 2",
+    "Soprano Sax", "Alto Sax", "Tenor Sax", "Baritone Sax",
+    "Oboe", "English Horn", "Bassoon", "Clarinet",
+    "Piccolo", "Flute", "Recorder", "Pan Flute",
+    "Blown Bottle", "Shakuhachi", "Whistle", "Ocarina",
+    "Square Lead", "Saw Lead", "Calliope Lead", "Chiff Lead",
+    "Charang Lead", "Voice Lead", "Fifths Lead", "Bass + Lead",
+    "New Age Pad", "Warm Pad", "Polysynth Pad", "Choir Pad",
+    "Bowed Pad", "Metallic Pad", "Halo Pad", "Sweep Pad",
+    "Rain FX", "Soundtrack FX", "Crystal FX", "Atmosphere FX",
+    "Brightness FX", "Goblins FX", "Echoes FX", "Sci-fi FX",
+    "Sitar", "Banjo", "Shamisen", "Koto",
+    "Kalimba", "Bagpipe", "Fiddle", "Shanai",
+    "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock",
+    "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
+    "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet",
+    "Telephone Ring", "Helicopter", "Applause", "Gunshot",
+};
+
 static const char PercussionMap[256] =
 "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"//GM
 "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" // 3 = bass drum
@@ -318,7 +366,8 @@ static unsigned UnicodeToASCIIapproximation(unsigned n) { return n; }
 class UserInterface
 {
 public:
-    static constexpr unsigned NColumns = 1216/20;
+    static constexpr unsigned NColumns = 1216/20; // Video output width
+    static constexpr unsigned MaxColumns = 256;
   #ifdef SUPPORT_VIDEO_OUTPUT
     static constexpr unsigned VidWidth  = 1216, VidHeight = 2160;
     static constexpr unsigned FontWidth =   20, FontHeight = 45;
@@ -334,12 +383,12 @@ public:
     int x, y, color, txtline, maxy;
 
     // Text:
-    char background[NColumns][1 + 23*MaxCards];
-    unsigned char backgroundcolor[NColumns][1 + 23*MaxCards];
+    char background[MaxColumns][1 + 23*MaxCards];
+    unsigned char backgroundcolor[MaxColumns][1 + 23*MaxCards];
     bool          touched[1 + 23*MaxCards]{false};
     // Notes:
-    char slots[NColumns][1 + 23*MaxCards];
-    unsigned char slotcolors[NColumns][1 + 23*MaxCards];
+    char slots[MaxColumns][1 + 23*MaxCards];
+    unsigned char slotcolors[MaxColumns][1 + 23*MaxCards];
 
     bool cursor_visible;
     char stderr_buffer[256];
@@ -375,8 +424,134 @@ public:
         std::memset(background, '.', sizeof(background));
         std::memset(backgroundcolor, 1, sizeof(backgroundcolor));
         std::setvbuf(stderr, stderr_buffer, _IOFBF, sizeof(stderr_buffer));
-        RawPrn("\r"); // Ensure cursor is at the x=0 we imagine it being
-        Print(0, 7, true, "Hit Ctrl-C to quit");
+        std::memset(slotcolors, 1, sizeof(slotcolors));
+    }
+    ~UserInterface() { EndScreen(); }
+    unsigned Columns() const
+    {
+        return TerminalActive ? std::min(WindowColumns, MaxColumns) : NColumns;
+    }
+    bool GameVisible() const
+    {
+#ifndef SUPPORT_PUZZLE_GAME
+        return false;
+#else
+        return ShowPuzzleGame && (!TerminalActive || (WinHeight() >= 28 && Columns() >= 50));
+#endif
+    }
+    unsigned LogHeight() const
+    {
+        if(!TerminalActive) return WinHeight();
+        return std::min(3u, std::max(2u, WinHeight() - (GameVisible() ? 25u : 1u)));
+    }
+    unsigned LabelLeft() const { return TerminalActive && GameVisible() ? 32u : 2u; }
+    unsigned LabelWidth() const
+    {
+        return std::min(24u, Columns() > LabelLeft()+8 ? (Columns()-LabelLeft()-8)/2 : 0u);
+    }
+    unsigned NoteLeft() const
+    {
+        return TerminalActive ? LabelLeft()+LabelWidth()+2 : 2u;
+    }
+    struct VisualNote { int ins, pressure; double bend; };
+    struct VisualChannel
+    {
+        unsigned patch = 0;
+        std::string name;
+        std::map<std::pair<int,int>, VisualNote> notes;
+    };
+    std::map<unsigned, VisualChannel> visual_channels;
+    std::vector<unsigned> visual_order;
+    void SetChannel(unsigned channel, unsigned patch, const std::string& name = "")
+    {
+        if(!visual_channels.count(channel)) visual_order.push_back(channel);
+        auto& v = visual_channels[channel];
+        v.patch = patch;
+        if(!name.empty()) v.name = name;
+        if(TerminalActive) DrawChannelLabel(channel);
+    }
+    int ChannelRow(unsigned channel) const
+    {
+        auto i = std::find(visual_order.begin(), visual_order.end(), channel);
+        return int(LogHeight()) + int(i-visual_order.begin());
+    }
+    void DrawChannelLabel(unsigned channel)
+    {
+        int row = ChannelRow(channel);
+        if(row >= int(WinHeight()) || !LabelWidth()) return;
+        const auto& v = visual_channels.at(channel);
+        std::string name = v.name.empty() ? (channel%16 == 9 ? "Drums" : GMNames[v.patch & 127]) : v.name;
+        name = std::to_string(channel%16+1) + " " + name;
+        for(unsigned n=0; n<LabelWidth(); ++n)
+        {
+            char c = n < name.size() && (unsigned char)name[n] >= 32 && (unsigned char)name[n] < 127 ? name[n] : ' ';
+            Draw(LabelLeft()+n, row, 8, c);
+        }
+    }
+    int NoteColumn(int note) const
+    {
+        int left = NoteLeft(), span = std::max(1, int(Columns())-left-1);
+        return left + ((note+55)%span+span)%span;
+    }
+    void DrawChannelNotes(unsigned channel)
+    {
+        int row = ChannelRow(channel);
+        if(row >= int(WinHeight())) return;
+        DrawChannelLabel(channel);
+        for(unsigned col=NoteLeft(); col<Columns(); ++col) Draw(col, row, 1, '.');
+        for(const auto& entry: visual_channels.at(channel).notes)
+        {
+            const auto& n = entry.second;
+            char c = n.pressure < 0 ? '%' : n.bend < 0 ? '<' : n.bend > 0 ? '>' : MIDIsymbols[n.ins & 255];
+            Draw(NoteColumn(entry.first.second), row, AllocateColor(n.ins & 255), c);
+        }
+    }
+    unsigned LayoutGeneration = 0;
+    void BeginScreen()
+    {
+#if !defined(__WIN32__) && !defined(__DJGPP__)
+        if(!isatty(STDERR_FILENO)) return;
+        TerminalActive = true;
+        RawPrn("\33[?1049h\33[?7l\33[?25l");
+        cursor_visible = false;
+        Reflow();
+#endif
+    }
+    void EndScreen()
+    {
+        if(!TerminalActive) return;
+        RawPrn("\33[0m\33[?7h\33[?25h\33[?1049l");
+        std::fflush(stderr);
+        TerminalActive = false;
+    }
+    void Reflow()
+    {
+        if(!TerminalActive) return;
+        WindowResized = 0;
+        ++LayoutGeneration;
+        color = -1;
+        Color(1);
+        RawPrn("\33[2J\33[H");
+        x = y = maxy = 0;
+        color = -1;
+        txtline = 0;
+        std::memset(slots, '.', sizeof(slots));
+        std::memset(background, '.', sizeof(background));
+        std::memset(backgroundcolor, 1, sizeof(backgroundcolor));
+        std::memset(slotcolors, 1, sizeof(slotcolors));
+        std::memset(touched, 0, sizeof(touched));
+        for(unsigned row=0; row<WinHeight(); ++row)
+            for(unsigned col=0; col<Columns(); ++col)
+            {
+                if(row < LogHeight() || col < NoteLeft())
+                    slots[col][row] = background[col][row] = ' ';
+                GotoXY(col, row);
+                Color(1);
+                PutC(background[col][row]);
+            }
+        Print(0, 15, true, "ADLMIDI  |  Ctrl-C to quit");
+        for(unsigned channel: visual_order) DrawChannelNotes(channel);
+        std::fflush(stderr);
     }
     void HideCursor()
     {
@@ -425,7 +600,7 @@ public:
     #else
         unsigned clr = color, tx = x, ty = y;
         unsigned cell_index = ty*TxWidth + tx;
-        if(cell_index < TxWidth*TxHeight)
+        if(tx < TxWidth && ty < TxHeight)
         {
             unsigned short what = (clr << 8) + (unsigned(c) & 0xFF);
             if(what != CharBuffer[cell_index])
@@ -503,7 +678,11 @@ public:
       #ifdef __DJGPP__
           putch(c);
       #else
-          std::fputc(c, stderr);
+          if(TerminalActive)
+          {
+              if(x >= 0 && x < int(Columns()) && y >= 0 && y < int(WinHeight()))
+                  std::fputc(c == '.' && x%4 != 0 ? ' ' : c, stderr);
+          }
       #endif
         }
         VidPut(c);
@@ -517,7 +696,11 @@ public:
         // Note: should essentially match PutC, except without updates to x
         va_list ap;
         va_start(ap, fmt);
+#if defined(__WIN32__) || defined(__DJGPP__)
         vfprintf(stderr, fmt, ap);
+#else
+        if(TerminalActive) vfprintf(stderr, fmt, ap);
+#endif
         va_end(ap);
     }
     #endif
@@ -529,16 +712,19 @@ public:
       #else
         int nchars = std::vsprintf(Line, fmt, ap); /* SECURITY: POSSIBLE BUFFER OVERFLOW (Cygwin) */
       #endif
-        //if(nchars == 0) return nchars;
+        nchars = std::max(0, std::min(nchars, int(sizeof(Line)-1)));
+        if(TerminalActive) txtline %= LogHeight();
 
         HideCursor();
-        for(unsigned tx = beginx; tx < NColumns; ++tx)
+        for(unsigned tx = beginx; tx < Columns(); ++tx)
         {
             int n = tx-beginx; // Index into Line[]
             if(n < nchars && Line[n] != '\n')
             {
                 GotoXY(tx, txtline);
                 Color( backgroundcolor[tx][txtline] = (/*Line[n] == '.' ? 1 :*/ color) );
+                slots[tx][txtline] = Line[n];
+                slotcolors[tx][txtline] = color;
                 PutC( background[tx][txtline] = Line[n] );
             }
             else //if(background[tx][txtline]!='.' && slots[tx][txtline]=='.')
@@ -546,14 +732,19 @@ public:
                 if(!ln) break;
                 GotoXY(tx,txtline);
                 Color( backgroundcolor[tx][txtline] = 1);
-                PutC( background[tx][txtline] = '.' );
+                char blank = TerminalActive ? ' ' : '.';
+                slots[tx][txtline] = blank;
+                slotcolors[tx][txtline] = 1;
+                PutC( background[tx][txtline] = blank );
             }
         }
         std::fflush(stderr);
 
         if(ln)
         {
-            txtline = (txtline + 1) % WinHeight();
+            txtline = TerminalActive
+                ? 1 + txtline % (LogHeight()-1)
+                : (txtline + 1) % WinHeight();
         }
 
         return nchars;
@@ -574,17 +765,37 @@ public:
         va_end(ap);
         return r;
     }
-    void IllustrateNote(int adlchn, int note, int ins, int pressure, double bend)
+    void IllustrateNote(int adlchn, int note, int ins, int pressure, double bend, unsigned channel = ~0u)
     {
+        if(TerminalActive && channel != ~0u)
+        {
+            if(!visual_channels.count(channel)) SetChannel(channel, ins & 127);
+            auto& notes = visual_channels[channel].notes;
+            auto key = std::make_pair(adlchn, note);
+            int column = NoteColumn(note), row = ChannelRow(channel);
+            if(pressure) notes[key] = {ins, pressure, bend};
+            else notes.erase(key);
+            DrawChannelLabel(channel);
+            Draw(column, row, 1, '.');
+            for(const auto& entry: notes)
+                if(NoteColumn(entry.first.second) == column)
+                {
+                    const auto& n = entry.second;
+                    char c = n.pressure < 0 ? '%' : n.bend < 0 ? '<' : n.bend > 0 ? '>' : MIDIsymbols[n.ins & 255];
+                    Draw(column, row, AllocateColor(n.ins & 255), c);
+                }
+            std::fflush(stderr);
+            return;
+        }
         HideCursor();
     #if 1
-        int notex = 2 + (note+55)%(NColumns-3);
-        int limit = WinHeight(), minline = 3;
+        const int left = NoteLeft();
+        const int span = std::max(1, int(Columns())-left-1);
+        int notex = left + ((note+55)%span+span)%span;
+        int limit = WinHeight(), minline = TerminalActive ? LogHeight() : 3;
+        if(minline >= limit || notex >= int(Columns())) return;
 
-        int notey = minline + adlchn;
-        notey %= std::max(1, limit-minline);
-        notey += minline;
-        notey %= limit;
+        int notey = minline + adlchn % std::max(1, limit-minline);
 
         char illustrate_char = background[notex][notey];
         if(pressure > 0)
@@ -612,6 +823,7 @@ public:
 
     void Draw(int notex,int notey, int color, char ch)
     {
+        if(notex < 0 || notex >= int(Columns()) || notey < 0 || notey >= int(WinHeight())) return;
         if(slots[notex][notey] != ch
         || slotcolors[notex][notey] != color)
         {
@@ -626,7 +838,7 @@ public:
                 touched[notey] = true;
 
                 GotoXY(0, notey);
-                for(int tx=0; tx<int(NColumns); ++tx)
+                for(int tx=0; tx<int(Columns()); ++tx)
                 {
                     if(slots[tx][notey] != '.')
                     {
@@ -651,7 +863,7 @@ public:
         const unsigned yellow_threshold = maxy*8/23;
 
         double amp[2] = {left*maxy, right*maxy};
-        for(unsigned y=2; y<maxy; ++y)
+        for(unsigned y=TerminalActive ? LogHeight()-1 : 2; y+1<maxy; ++y)
             for(unsigned w=0; w<2; ++w)
             {
                 char c = amp[w] > (maxy-1)-y ? '|' : background[w][y+1];
@@ -672,6 +884,18 @@ public:
     {
         // Record the maximum line count seen
         if(newy > maxy) maxy = newy;
+        if(TerminalActive)
+        {
+            if(newx != x || newy != y) RawPrn("\33[%d;%dH", newy+1, newx+1);
+            x = newx;
+            y = newy;
+            return;
+        }
+#if !defined(__WIN32__) && !defined(__DJGPP__)
+        x = newx;
+        y = newy;
+        return;
+#endif
         // Go down with '\n' (resets cursor at beginning of line)
         while(newy > y)
         {
@@ -720,6 +944,20 @@ public:
             if(0)
 #endif
             {
+              if(TerminalActive)
+              {
+                  static const unsigned palette[16] = {
+                      0x000000,0x18183F,0x00AA00,0x5F5FAF,
+                      0xAA0000,0xAA00AA,0x87875F,0xAAAAAA,
+                      0x337799,0x5555FF,0x55FF55,0x55FFFF,
+                      0xFF5555,0xFF55FF,0xFFFF55,0xFFFFFF
+                  };
+                  unsigned rgb = palette[newcolor & 15];
+                  RawPrn("\33[0;38;2;%u;%u;%u;48;2;0;0;0m",
+                         rgb >> 16, (rgb >> 8) & 255, rgb & 255);
+                  color = newcolor;
+                  return;
+              }
               static const char map[8+1] = "04261537";
               RawPrn("\33[0;%s40;3%c", (newcolor&8) ? "1;" : "", map[newcolor&7]);
               // If xterm-256color is used, try using improved colors:
@@ -755,19 +993,16 @@ public:
     bool DoCheckTetris()
     {
     #ifdef SUPPORT_PUZZLE_GAME
-        static ADLMIDI_PuzzleGame::TetrisAI    player(2);
-        static ADLMIDI_PuzzleGame::TetrisHuman computer(31);
-
-        int a = player.GameLoop();
-        int b = computer.GameLoop();
-
-        if(a >= 0 && b >= 0)
+        if(!GameVisible()) return true;
+        static std::unique_ptr<ADLMIDI_PuzzleGame::TetrisAI> player;
+        static unsigned generation = ~0u;
+        if(!player || generation != LayoutGeneration)
         {
-            player.incoming   += b;
-            computer.incoming += a;
+            player.reset(new ADLMIDI_PuzzleGame::TetrisAI(2));
+            generation = LayoutGeneration;
         }
-        return player.DelayOpinion() >= 0
-            && computer.DelayOpinion() >= 0;
+        player->GameLoop();
+        return player->DelayOpinion() >= 0;
     #else
         return true;
     #endif
@@ -776,7 +1011,8 @@ public:
     bool TetrisLaunched = false;
     bool CheckTetris()
     {
-        if(TetrisLaunched) return DoCheckTetris();
+        if(TerminalActive && WindowResized) Reflow();
+        if(TetrisLaunched && ShowPuzzleGame) return DoCheckTetris();
         return true;
     }
 } UI;
@@ -788,8 +1024,10 @@ namespace ADLMIDI_PuzzleGame
     {
         static const unsigned char valid_attrs[] = {8,6,5,3};
         unsigned char ch = cell, attr = cell >> 8;
-        int height = WinHeight();//std::min(NumCards*18, 50u);
-        y = std::max(0, int(std::min(height, 40) - 25 + y));
+        if(!UI.GameVisible()) return;
+        int height = WinHeight();
+        y += TerminalActive ? UI.LogHeight() : std::max(0, std::min(height, 40) - 25);
+        if(x < 0 || x >= int(UI.Columns()) || y < 0 || y >= height) return;
         if(ch == 0xDB) ch = '#';
         if(ch == 0xB0) ch = '*';
         if(attr != 1) attr = valid_attrs[attr % sizeof(valid_attrs)];
@@ -797,9 +1035,7 @@ namespace ADLMIDI_PuzzleGame
         //bool diff = UI.background[x][y] != UI.slots[x][y];
         UI.backgroundcolor[x][y] = attr;
         UI.background[x][y]      = ch;
-        UI.GotoXY(x,y);
-        UI.Color(attr);
-        UI.PutC(ch);
+        UI.Draw(x,y, attr, ch);
         //UI.Draw(x,y, attr, ch);
     }
 }
@@ -1114,6 +1350,7 @@ class MIDIplay
 
     std::map<std::string, unsigned> devices;
     std::map<unsigned/*track*/, unsigned/*channel begin index*/> current_device;
+    std::map<unsigned, std::string> track_names;
 
     // Persistent settings for each MIDI channel
     struct MIDIchannel
@@ -1564,7 +1801,7 @@ private:
                     AdlChannel::users_t::iterator k = ch[c].users.find(my_loc);
                     if(k != ch[c].users.end())
                         ch[c].users.erase(k);
-                    UI.IllustrateNote(c, tone, midiins, 0, 0.0);
+                    UI.IllustrateNote(c, tone, midiins, 0, 0.0, MidCh);
 
                     if(ch[c].users.empty())
                     {
@@ -1579,7 +1816,7 @@ private:
                     //          Also will avoid overwriting it very soon.
                     AdlChannel::LocationData& d = ch[c].users[my_loc];
                     d.sustained = true; // note: not erased!
-                    UI.IllustrateNote(c, tone, midiins, -1, 0.0);
+                    UI.IllustrateNote(c, tone, midiins, -1, 0.0, MidCh);
                 }
                 info.phys.erase(j);
                 continue;
@@ -1620,7 +1857,7 @@ private:
                     if(Ch[MidCh].vibrato && d.vibdelay >= Ch[MidCh].vibdelay)
                         bend += Ch[MidCh].vibrato * Ch[MidCh].vibdepth * std::sin(Ch[MidCh].vibpos);
                     opl.NoteOn(c, 172.00093 * std::exp(0.057762265 * (tone + bend + phase)));
-                    UI.IllustrateNote(c, tone, midiins, vol, Ch[MidCh].bend);
+                    UI.IllustrateNote(c, tone, midiins, vol, Ch[MidCh].bend, MidCh);
                 }
             }
         }
@@ -1714,7 +1951,8 @@ private:
             if(evtype == 6 && data == "loopStart") loopStart = true;
             if(evtype == 6 && data == "loopEnd"  ) loopEnd   = true;
             if(evtype == 9) current_device[tk] = ChooseDevice(data);
-            if(evtype >= 1 && evtype <= 6)
+            if(evtype == 4 || (evtype == 3 && TrackData.size() > 1)) track_names[tk] = data;
+            if(evtype >= 1 && evtype <= 6 && evtype != 4 && (evtype != 3 || TrackData.size() == 1))
                 UI.PrintLn("Meta %d: %s", evtype, data.c_str());
 
             if(evtype == 0xE3) // Special non-spec ADLMIDI special for IMF playback: Direct poke to AdLib
@@ -1739,6 +1977,8 @@ private:
         MidCh += current_device[tk];
 
         CurrentPosition.track[tk].status = byte;
+        if(EvType == 0x8 || EvType == 0x9 || EvType == 0xA || EvType == 0xC)
+            UI.SetChannel(MidCh, Ch[MidCh].patch, track_names[tk]);
         switch(EvType)
         {
             case 0x8: // Note off
@@ -2015,6 +2255,7 @@ private:
             }
             case 0xC: // Patch change
                 Ch[MidCh].patch = TrackData[tk][CurrentPosition.track[tk].ptr++];
+                UI.SetChannel(MidCh, Ch[MidCh].patch, track_names[tk]);
                 break;
             case 0xD: // Channel after-touch
             {
@@ -2182,13 +2423,13 @@ private:
                 UI.IllustrateNote(
                     from_channel,
                     i->second.tone,
-                    i->second.midiins, 0, 0.0);
+                    i->second.midiins, 0, 0.0, j->first.MidCh);
                 UI.IllustrateNote(
                     c,
                     i->second.tone,
                     i->second.midiins,
                     i->second.vol,
-                    0.0);
+                    0.0, j->first.MidCh);
 
                 i->second.phys.erase(from_channel);
                 i->second.phys[c] = j->second.ins;
@@ -2230,7 +2471,7 @@ private:
                 && j->second.sustained)
                 {
                     int midiins = '?';
-                    UI.IllustrateNote(c, j->first.note, midiins, 0, 0.0);
+                    UI.IllustrateNote(c, j->first.note, midiins, 0, 0.0, j->first.MidCh);
                     ch[c].users.erase(j);
                 }
             }
@@ -3107,8 +3348,8 @@ public:
 
 static void TidyupAndExit(int)
 {
-    UI.ShowCursor();
-    UI.Color(7);
+    UI.EndScreen();
+    Input.Restore();
     std::fflush(stderr);
     signal(SIGINT, SIG_DFL);
     raise(SIGINT);
@@ -3430,6 +3671,11 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    UI.BeginScreen();
+    if(AdlBank < sizeof(banknames)/sizeof(*banknames))
+        UI.PrintLn("Bank %u: %s", AdlBank, banknames[AdlBank]);
+    UI.PrintLn("%u OPL3 cards | %u four-op channels", NumCards, NumFourOps);
+
 #ifdef __DJGPP__
 
     unsigned TimerPeriod = 0x1234DDul / NewTimerFreq;
@@ -3547,7 +3793,7 @@ int main(int argc, char** argv)
             : player.Tick(eat_delay, mindelay);
 
         UI.GotoXY(0,0);
-        UI.ShowCursor();
+        if(!TerminalActive) UI.ShowCursor();
 
         delay = nextdelay;
     }

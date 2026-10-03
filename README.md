@@ -34,6 +34,15 @@ make -j4
 ./adlmidi /path/to/song.mid -nl
 ```
 
+Playback uses the terminal's alternate screen with a black background and fixed
+RGB colours. Metadata, the single puzzle board, and notes have separate areas.
+Each MIDI channel has an instrument label beside its notes. Track/instrument
+names from the MIDI file are used when available, with General MIDI names as
+the fallback.
+The layout adjusts when you resize the terminal; resizing restarts the puzzle.
+The puzzle is hidden automatically in terminals smaller than 50 columns or
+29 rows. Font choice remains controlled by your terminal settings.
+
 OpenMP is enabled automatically when the compiler supports it; Apple's Clang
 builds without it. The macOS compatibility changes come from
 [upstream issue #20](https://github.com/bisqwit/adlmidi/issues/20).
