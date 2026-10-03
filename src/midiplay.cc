@@ -240,7 +240,9 @@ class Input
     void* inhandle;
 #endif
 #if (!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__)
-    struct termio back;
+    struct termios back{};
+    bool terminal_saved = false;
+    int original_flags = -1;
 #endif
 public:
     Input()
@@ -249,19 +251,28 @@ public:
         inhandle = GetStdHandle(STD_INPUT_HANDLE);
 #endif
 #if (!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__)
-        ioctl(0, TCGETA, &back);
-        struct termio term = back;
-        term.c_lflag &= ~(ICANON|ECHO);
-        term.c_cc[VMIN] = 0; // 0=no block, 1=do block
-        if(ioctl(0, TCSETA, &term) < 0)
-            fcntl(0, F_SETFL, fcntl(0, F_GETFL) | O_NONBLOCK);
+        terminal_saved = tcgetattr(0, &back) == 0;
+        if(terminal_saved)
+        {
+            struct termios term = back;
+            term.c_lflag &= ~(ICANON|ECHO);
+            term.c_cc[VMIN] = 0;
+            term.c_cc[VTIME] = 0;
+            if(tcsetattr(0, TCSANOW, &term) == 0) return;
+        }
+        original_flags = fcntl(0, F_GETFL);
+        if(original_flags >= 0) fcntl(0, F_SETFL, original_flags | O_NONBLOCK);
 #endif
     }
     ~Input()
     {
+        Restore();
+    }
+    void Restore()
+    {
 #if (!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__)
-        if(ioctl(0, TCSETA, &back) < 0)
-            fcntl(0, F_SETFL, fcntl(0, F_GETFL) &~ O_NONBLOCK);
+        if(terminal_saved) tcsetattr(0, TCSANOW, &back);
+        if(original_flags >= 0) fcntl(0, F_SETFL, original_flags);
 #endif
     }
 

@@ -6,7 +6,13 @@ CXXLINK = $(CXX)
 
 #DEBUG = -O0 -fno-inline -D_GLIBCXX_DEBUG -g -fstack-protector-all -fdata-sections -fsanitize=address
 
-DEBUG=-Ofast -g -fopenmp -march=native
+DEBUG=-O3 -ffast-math -g -march=native
+
+# Enable OpenMP if the compiler supports it
+OPENMP_SUPPORTED := $(shell echo 'int main(){}' | $(CXX) -fopenmp -x c++ - -o /dev/null 2>/dev/null && echo yes)
+ifeq ($(OPENMP_SUPPORTED),yes)
+DEBUG += -fopenmp
+endif
 
 #DEBUG += -fno-tree-vectorize
 

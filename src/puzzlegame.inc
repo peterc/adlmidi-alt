@@ -8,7 +8,8 @@
 #include <cstdio>    // for std::puts
 #include <cstdlib>   // for std::rand
 #include <cstring>   // for std::memcpy
-#include <algorithm> // for std::abs, std::max, std::random_shuffle
+#include <algorithm> // for std::abs, std::max, std::shuffle
+#include <random>    // for std::mt19937, std::random_device
 #include <utility>   // for std::pair
 #include <vector>    // for std::vector
 #include <cstdint>
@@ -296,7 +297,8 @@ namespace ADLMIDI_PuzzleGame
             resting   = false;
 
             /*std::random_shuffle(positions1.begin(), positions1.end());*/
-            std::random_shuffle(positions2.begin(), positions2.end());
+            { static std::mt19937 rng(std::random_device{}());
+              std::shuffle(positions2.begin(), positions2.end(), rng); }
 
             ply = 0;
 

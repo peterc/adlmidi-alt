@@ -23,6 +23,21 @@ ADLMIDI is a MIDI player that uses OPL3 emulation.
 * Support for ScummVM, Doom, IMF and CMF files
 * This project is developed in C++, but a GW-BASIC version is also provided (MIDIPLAY.BAS). This player was first implemented in GW-BASIC for a Youtube demonstration video! With alterations that take 15 seconds to implement, it can be run in QBasic and QuickBASIC too. Note: The GW-BASIC version does not contain all of the same features that the C++ version does.
 
+## Building on macOS
+
+Install the Xcode Command Line Tools (`xcode-select --install`) if needed, then
+install the dependencies with Homebrew and build:
+
+```sh
+brew install pkg-config sdl2
+make -j4
+./adlmidi /path/to/song.mid -nl
+```
+
+OpenMP is enabled automatically when the compiler supports it; Apple's Clang
+builds without it. The macOS compatibility changes come from
+[upstream issue #20](https://github.com/bisqwit/adlmidi/issues/20).
+
 ## Usage
 
 ```
