@@ -19,6 +19,7 @@
 #include <cmath>  // exp, log, ceil
 #include <ctime>
 #include <memory>
+#include <chrono>
 
 #include <assert.h>
 
@@ -284,6 +285,8 @@ static const char PercussionMap[256] =
 
 class Input
 {
+    enum class EscapeState { None, Pending, Sequence } escape_state = EscapeState::None;
+    std::chrono::steady_clock::time_point escape_time;
 #ifdef __WIN32__
     void* inhandle;
 #endif
@@ -349,6 +352,36 @@ public:
         if(read(0, &c, 1) == 1) return c;
 #endif
         return '\0';
+    }
+    bool StopRequested()
+    {
+        while(char c = PeekInput())
+        {
+            // Arrow/function keys also begin with Escape. Consume their sequence
+            // rather than treating its leading byte as a request to quit.
+            if(escape_state == EscapeState::Sequence)
+            {
+                if(c >= 0x40 && c <= 0x7E) escape_state = EscapeState::None;
+                continue;
+            }
+            if(escape_state == EscapeState::Pending)
+            {
+                escape_state = EscapeState::None;
+                if(c == '[' || c == 'O')
+                {
+                    escape_state = EscapeState::Sequence;
+                    continue;
+                }
+            }
+            if(c == 'q' || c == 3) return true;
+            if(c == 27)
+            {
+                escape_state = EscapeState::Pending;
+                escape_time = std::chrono::steady_clock::now();
+            }
+        }
+        return escape_state == EscapeState::Pending
+            && std::chrono::steady_clock::now() - escape_time >= std::chrono::milliseconds(30);
     }
 } Input;
 
@@ -549,7 +582,7 @@ public:
                 Color(1);
                 PutC(background[col][row]);
             }
-        Print(0, 15, true, "ADLMIDI  |  Ctrl-C to quit");
+        Print(0, 15, true, "ADLMIDI  |  q / Esc / Ctrl-C to quit");
         for(unsigned channel: visual_order) DrawChannelNotes(channel);
         std::fflush(stderr);
     }
@@ -1011,6 +1044,11 @@ public:
     bool TetrisLaunched = false;
     bool CheckTetris()
     {
+        if(!DoingInstrumentTesting && Input.StopRequested())
+        {
+            QuitFlag = true;
+            return true;
+        }
         if(TerminalActive && WindowResized) Reflow();
         if(TetrisLaunched && ShowPuzzleGame) return DoCheckTetris();
         return true;
@@ -3711,6 +3749,7 @@ int main(int argc, char** argv)
     UI.TetrisLaunched = true;
     for(double delay=0; !QuitFlag; )
     {
+        if(!DoingInstrumentTesting && Input.StopRequested()) break;
     #ifndef __DJGPP__
         const double eat_delay = delay < maxdelay ? delay : maxdelay;
         delay -= eat_delay;
@@ -3757,7 +3796,7 @@ int main(int argc, char** argv)
             //    AudioBuffer.size() * .5e3 / obtained.freq);
         #ifndef __WIN32__
             const SDL_AudioSpec& spec_ = (WritePCMfile ? spec : obtained);
-            for(unsigned grant=0; AudioBuffer.size() > spec_.samples + (spec_.freq*2) * OurHeadRoomLength; ++grant)
+            for(unsigned grant=0; !QuitFlag && AudioBuffer.size() > spec_.samples + (spec_.freq*2) * OurHeadRoomLength; ++grant)
             {
                 if(!WritePCMfile)
                 {

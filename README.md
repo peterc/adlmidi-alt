@@ -40,6 +40,8 @@ The puzzle game is disabled by default. To enable it:
 ./adlmidi /path/to/song.mid -nl -game
 ```
 
+Press `q`, Escape, or Ctrl-C to stop playback and restore the terminal.
+
 Playback uses the terminal's alternate screen with a black background and fixed
 RGB colours. Metadata, the single puzzle board, and notes have separate areas.
 Each MIDI channel has an instrument label beside its notes. Track/instrument
