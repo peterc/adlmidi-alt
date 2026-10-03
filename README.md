@@ -34,6 +34,12 @@ make -j4
 ./adlmidi /path/to/song.mid -nl
 ```
 
+The puzzle game is disabled by default. To enable it:
+
+```sh
+./adlmidi /path/to/song.mid -nl -game
+```
+
 Playback uses the terminal's alternate screen with a black background and fixed
 RGB colours. Metadata, the single puzzle board, and notes have separate areas.
 Each MIDI channel has an instrument label beside its notes. Track/instrument
@@ -57,6 +63,8 @@ Usage: adlmidi <midifilename> [ <options> ] [ <banknumber> [ <numcards> [ <numfo
  -v Enables vibrato amplification mode
  -s Enables scaling of modulator volumes
  -nl Quit without looping
+ -game Show the puzzle game (disabled by default)
+ -no-game Hide the puzzle game
  -w Write WAV file rather than playing
     Banks: 0 = AIL (Star Control 3, Albion, Empire 2, Sensible Soccer, Settlers 2, many others)
            1 = Bisqwit (selection of 4op and 2op)

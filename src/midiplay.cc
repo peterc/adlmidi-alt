@@ -72,7 +72,7 @@ static bool QuitFlag = false, FakeDOSshell = false;
 static unsigned SkipForward = 0;
 static bool DoingInstrumentTesting = false;
 static bool QuitWithoutLooping = false;
-static bool ShowPuzzleGame = true;
+static bool ShowPuzzleGame = false;
 static bool WritePCMfile = false;
 static std::string PCMfilepath = "adlmidi.wav";
 #ifdef SUPPORT_VIDEO_OUTPUT
@@ -3452,6 +3452,8 @@ int main(int argc, char** argv)
             " -v              Enables vibrato amplification mode\n"
             " -s              Enables scaling of modulator volumes\n"
             " -nl             Quit without looping\n"
+            " -game           Show the puzzle game (disabled by default)\n"
+            " -no-game        Hide the puzzle game\n"
 #ifndef __DJGPP__
             " -reverb <specs> Controls reverb (default: gain=6:room=.7:factor=.6:damping=.8:predelay=0:stereo=1)\n"
             " -reverb none    Disables reverb (also -nr)\n"
@@ -3498,6 +3500,10 @@ int main(int argc, char** argv)
             HighTremoloMode = true;
         else if(!std::strcmp("-nl", argv[2]))
             QuitWithoutLooping = true;
+        else if(!std::strcmp("-no-game", argv[2]))
+            ShowPuzzleGame = false;
+        else if(!std::strcmp("-game", argv[2]))
+            ShowPuzzleGame = true;
 #ifndef __DJGPP__
         else if(!std::strcmp("-nr", argv[2]))
             ParseReverb("none");
