@@ -62,9 +62,9 @@ static const unsigned MaxSamplesAtTime = 512; // 512=dbopl limitation
 static const unsigned MaxCards = 1;
 static const unsigned OPLBase = 0x388;
 #endif
-static unsigned AdlBank    = 0;
+static unsigned AdlBank    = 1;
 static unsigned NumFourOps = 7;
-static unsigned NumCards   = 2;
+static unsigned NumCards   = std::min(4u, MaxCards);
 static bool HighTremoloMode   = false;
 static bool HighVibratoMode   = false;
 static bool AdlPercussionMode = false;
@@ -3544,6 +3544,8 @@ int main(int argc, char** argv)
             "     Use banks 2-5 to play Descent \"q\" soundtracks.\n"
             "     Look up the relevant bank number from descent.sng.\n"
             "\n"
+            "     Default: bank %u (Bisqwit), %u OPL3 cards; automatic four-op allocation.\n"
+            "\n"
             "     <numfourops> can be used to specify the number\n"
             "     of four-op channels to use. Each four-op channel eats\n"
             "     the room of two regular channels. Use as many as required.\n"
@@ -3552,7 +3554,7 @@ int main(int argc, char** argv)
             "\n"
             "     When playing Creative Music Files (CMF), try the\n"
             "     -p and -v options if it sounds wrong otherwise.\n"
-            "\n"
+            "\n", AdlBank, NumCards
             );
         UI.ShowCursor();
         return 0;

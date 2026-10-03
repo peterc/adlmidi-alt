@@ -42,6 +42,12 @@ The puzzle game is disabled by default. To enable it:
 
 Press `q`, Escape, or Ctrl-C to stop playback and restore the terminal.
 
+Playback defaults to bank 1 (Bisqwit) and four OPL3 cards, with four-op voices
+allocated automatically for the selected bank. Bank 1 gets 16 four-op and 40
+two-op voices. Bank 0 remains available with `./adlmidi song.mid 0`.
+Use `./adlmidi song.mid 5` for bank 5; explicit card and
+four-op counts still override them, for example `./adlmidi song.mid 5 1 4`.
+
 Output gain defaults to +12 dB for both playback and WAV exports. Use `-gain`
 to adjust it, for example `./adlmidi song.mid -gain 6`, or `-gain 0` for no
 output boost. The range is -60 to +30 dB. Soft peak limiting protects loud
