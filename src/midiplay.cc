@@ -21,6 +21,9 @@
 #include <memory>
 #include <chrono>
 #include <atomic>
+#include <array>
+#include <mutex>
+#include <condition_variable>
 
 #include <assert.h>
 
@@ -1052,6 +1055,11 @@ public:
             QuitFlag = true;
             return true;
         }
+        return StepDisplay();
+    }
+    // The part of CheckTetris() that does not read the keyboard.
+    bool StepDisplay()
+    {
         if(TerminalActive && WindowResized) Reflow();
         if(TetrisLaunched && ShowPuzzleGame) return DoCheckTetris();
         return true;
@@ -2993,7 +3001,8 @@ namespace WindowsAudio
 }
 #else
 static std::deque<short> AudioBuffer;
-static MutexType AudioBuffer_lock;
+static std::mutex AudioBuffer_lock;
+static std::condition_variable AudioBuffer_drained; // Signalled by the callback
 static constexpr unsigned StopFadeFrames = PCM_RATE / 50; // 20 ms
 static std::atomic<bool> AudioStopping{false};
 static std::atomic<unsigned> StopFadeRemaining{0};
@@ -3003,15 +3012,20 @@ static void AdlAudioCallback(void*, Uint8* stream, int len)
     // Always initialize the tail if the producer has not queued enough audio.
     std::memset(stream, 0, len);
     short* target = (short*) stream;
-    AudioBuffer_lock.Lock();
-    /*if(len != AudioBuffer.size())
-        fprintf(stderr, "len=%d stereo samples, AudioBuffer has %u stereo samples",
-            len/4, (unsigned) AudioBuffer.size()/2);*/
-    unsigned ate = len/2; // number of shorts
-    if(ate > AudioBuffer.size()) ate = AudioBuffer.size();
-    for(unsigned a=0; a<ate; ++a)
-        target[a] = AudioBuffer[a];
-    AudioBuffer.erase(AudioBuffer.begin(), AudioBuffer.begin() + ate);
+    {
+        std::lock_guard lock(AudioBuffer_lock);
+        /*if(len != AudioBuffer.size())
+            fprintf(stderr, "len=%d stereo samples, AudioBuffer has %u stereo samples",
+                len/4, (unsigned) AudioBuffer.size()/2);*/
+        unsigned ate = len/2; // number of shorts
+        if(ate > AudioBuffer.size()) ate = AudioBuffer.size();
+        for(unsigned a=0; a<ate; ++a)
+            target[a] = AudioBuffer[a];
+        AudioBuffer.erase(AudioBuffer.begin(), AudioBuffer.begin() + ate);
+        //fprintf(stderr, " - remain %u\n", (unsigned) AudioBuffer.size()/2);
+    }
+    // Wake the main loop, which sleeps while the queue is full.
+    AudioBuffer_drained.notify_one();
     if(AudioStopping.load())
     {
         unsigned remaining = StopFadeRemaining.load();
@@ -3024,25 +3038,66 @@ static void AdlAudioCallback(void*, Uint8* stream, int len)
         }
         StopFadeRemaining.store(remaining);
     }
-    //fprintf(stderr, " - remain %u\n", (unsigned) AudioBuffer.size()/2);
-    AudioBuffer_lock.Unlock();
 }
 #endif // WIN32
 
-struct FourChars
+// Streams 16-bit stereo PCM into a WAV file. The length fields of the header
+// are filled in by Close(), so a block of audio costs a single fwrite.
+class WavWriter
 {
-    char ret[4];
+    static constexpr long HeaderSize = 44;
+    std::FILE* fp = nullptr;
 
-    FourChars(const char* s)
+    void Put(std::string_view tag) { std::fwrite(tag.data(), 1, tag.size(), fp); }
+    void Put(std::uint32_t value, unsigned nbytes) // Little-endian
     {
-        for(unsigned c=0; c<4; ++c) ret[c] = s[c];
+        for(unsigned n=0; n<nbytes; ++n) std::fputc((value >> (n*8)) & 0xFF, fp);
     }
-    FourChars(unsigned w) // Little-endian
+    void PutHeader(std::uint32_t datasize)
     {
-        for(unsigned c=0; c<4; ++c) ret[c] = (w >> (c*8)) & 0xFF;
+        constexpr unsigned channels = 2, bits = 16, blockalign = channels * bits / 8;
+        Put("RIFF"); Put(HeaderSize - 8 + datasize, 4);
+        Put("WAVE");
+        Put("fmt "); Put(16, 4);        // fmt subchunk, which is 16 bytes:
+        Put(1, 2);                      //   PCM
+        Put(channels, 2);
+        Put(PCM_RATE, 4);               //   sampling rate
+        Put(PCM_RATE * blockalign, 4);  //   byte rate
+        Put(blockalign, 2);
+        Put(bits, 2);
+        Put("data"); Put(datasize, 4);
+    }
+public:
+    WavWriter() = default;
+    WavWriter(const WavWriter&) = delete;
+    WavWriter& operator=(const WavWriter&) = delete;
+    ~WavWriter() { Close(); }
+
+    bool Open(const std::string& path) // "-" = stdout
+    {
+        fp = path == "-" ? stdout : std::fopen(path.c_str(), "wb");
+        if(fp) PutHeader(0);
+        return fp != nullptr;
+    }
+    void Write(const short* samples, std::size_t n)
+    {
+        if(fp) std::fwrite(samples, sizeof(*samples), n, fp);
+    }
+    void Close()
+    {
+        if(!fp) return;
+        // A pipe cannot be rewound; the lengths stay zero there.
+        const long end = std::ftell(fp);
+        if(end >= HeaderSize && std::fseek(fp, 0, SEEK_SET) == 0)
+        {
+            PutHeader(end - HeaderSize);
+            std::fseek(fp, end, SEEK_SET);
+        }
+        if(fp == stdout) std::fflush(fp); else std::fclose(fp);
+        fp = nullptr;
     }
 };
-
+static WavWriter WavOutput;
 
 static void SendStereoAudio(unsigned long count, int* samples)
 {
@@ -3128,15 +3183,8 @@ static void SendStereoAudio(unsigned long count, int* samples)
         for(unsigned w=0; w<2; ++w)
             reverb_data.chan[w].Process(count);
 
-    // Convert to signed 16-bit int format and put to playback queue
-#ifdef __WIN32__
-    std::vector<short> AudioBuffer(count*2);
-    const size_t pos = 0;
-#else
-    AudioBuffer_lock.Lock();
-    size_t pos = AudioBuffer.size();
-    AudioBuffer.resize(pos + count*2);
-#endif
+    // Convert to signed 16-bit int format
+    std::array<short, MaxSamplesAtTime*2> block; // count <= MaxSamplesAtTime here
     static const float output_gain = std::pow(10.0, OutputGainDb / 20.0);
     for(unsigned long p = 0; p < count; ++p)
     {
@@ -3164,60 +3212,22 @@ static void SendStereoAudio(unsigned long count, int* samples)
         for(unsigned w=0; w<2; ++w)
         {
             float pcm = out[w] * 32768.f;
-            AudioBuffer[pos+p*2+w] =
+            block[p*2+w] =
                 pcm<-32768.f ? -32768 :
                 pcm>32767.f ?  32767 : pcm;
         }
     }
     if(WritePCMfile)
+        WavOutput.Write(block.data(), count*2);
+    else
     {
-        /* HACK: Cheat on DOSBox recording: Record audio separately on Windows. */
-        static FILE* fp = nullptr;
-        if(!fp)
-        {
-            fp = PCMfilepath == "-" ? stdout
-                                    : fopen(PCMfilepath.c_str(), "wb");
-            if(fp)
-            {
-                FourChars Bufs[] = {
-                    "RIFF", (0x24u),  // RIFF type, file length - 8
-                    "WAVE",           // WAVE file
-                    "fmt ", (0x10u),  // fmt subchunk, which is 16 bytes:
-                      "\1\0\2\0",     // PCM (1) & stereo (2)
-                      (48000u    ), // sampling rate
-                      (48000u*2*2), // byte rate
-                      "\2\0\20\0",    // block align & bits per sample
-                    "data", (0x00u)  //  data subchunk, which is so far 0 bytes.
-                };
-                for(unsigned c=0; c<sizeof(Bufs)/sizeof(*Bufs); ++c)
-                    std::fwrite(Bufs[c].ret, 1, 4, fp);
-            }
-        }
-
-        // Using a loop, because our data type is a deque, and
-        // the data might not be contiguously stored in memory.
-        for(unsigned long p = 0; p < 2*count; ++p)
-            std::fwrite(&AudioBuffer[pos+p], 1, 2, fp);
-
-        /* Update the WAV header */
-        if(true)
-        {
-            long pos = std::ftell(fp);
-            if(pos != -1)
-            {
-                long datasize = pos - 0x2C;
-                if(std::fseek(fp, 4,  SEEK_SET) == 0) // Patch the RIFF length
-                    std::fwrite( FourChars(0x24u+datasize).ret, 1,4, fp);
-                if(std::fseek(fp, 40, SEEK_SET) == 0) // Patch the data length
-                    std::fwrite( FourChars(datasize).ret, 1,4, fp);
-                std::fseek(fp, pos, SEEK_SET);
-            }
-        }
-
-        std::fflush(fp);
-
-        //if(std::ftell(fp) >= 48000*4*10*60)
-        //    raise(SIGINT);
+        // Put to playback queue
+#ifdef __WIN32__
+        WindowsAudio::Write( (const unsigned char*) block.data(), count*2*sizeof(short));
+#else
+        std::lock_guard lock(AudioBuffer_lock);
+        AudioBuffer.insert(AudioBuffer.end(), block.begin(), block.begin() + count*2);
+#endif
     }
 #ifdef SUPPORT_VIDEO_OUTPUT
     if(WriteVideoFile)
@@ -3261,12 +3271,6 @@ static void SendStereoAudio(unsigned long count, int* samples)
             }
         }
     }
-#endif
-#ifndef __WIN32__
-    AudioBuffer_lock.Unlock();
-#else
-    if(!WritePCMfile)
-        WindowsAudio::Write( (const unsigned char*) &AudioBuffer[0], 2*AudioBuffer.size());
 #endif
 }
 #endif /* not DJGPP */
@@ -3766,6 +3770,15 @@ int main(int argc, char** argv)
         return 0;
     }
 
+#ifndef __DJGPP__
+    if(WritePCMfile && !WavOutput.Open(PCMfilepath))
+    {
+        std::perror(PCMfilepath.c_str());
+        UI.ShowCursor();
+        return 2;
+    }
+#endif
+
     UI.BeginScreen();
     if(AdlBank < sizeof(banknames)/sizeof(*banknames))
         UI.PrintLn("Bank %u: %s", AdlBank, banknames[AdlBank]);
@@ -3846,22 +3859,31 @@ int main(int argc, char** argv)
             //fprintf(stderr, "Enter: %u (%.2f ms)\n", (unsigned)AudioBuffer.size(),
             //    AudioBuffer.size() * .5e3 / obtained.freq);
         #ifndef __WIN32__
-            const SDL_AudioSpec& spec_ = (WritePCMfile ? spec : obtained);
-            for(unsigned grant=0; !QuitFlag && AudioBuffer.size() > spec_.samples + (spec_.freq*2) * OurHeadRoomLength; ++grant)
+            if(WritePCMfile)
             {
-                if(!WritePCMfile)
+                // Nothing paces a file render, so step the display once per
+                // millisecond of audio, the cadence it gets in live playback.
+                static unsigned long unstepped = 0;
+                for(unstepped += n_samples; unstepped >= PCM_RATE/1000; unstepped -= PCM_RATE/1000)
+                    UI.StepDisplay();
+            }
+            else
+            {
+                // Sleep until the audio callback has made room in the queue.
+                // The puzzle game is stepped from here and wants a ~1 ms
+                // cadence; otherwise wake just often enough to notice keys
+                // and terminal resizes.
+                const std::size_t high_water = obtained.samples + (obtained.freq*2) * OurHeadRoomLength;
+                const std::chrono::milliseconds nap(UI.GameVisible() ? 1 : 20);
+                bool settle = true;
+                std::unique_lock lock(AudioBuffer_lock);
+                for(unsigned grant=0; !QuitFlag && AudioBuffer.size() > high_water; ++grant)
                 {
-                    if(UI.CheckTetris() || grant%4==0)
-                    {
-                        SDL_Delay(1); // std::min(10.0, 1e3 * eat_delay) );
-                    }
-                }
-                else
-                {
-                    for(unsigned n=0; n<128; ++n) UI.CheckTetris();
-                    AudioBuffer_lock.Lock();
-                    AudioBuffer.clear();
-                    AudioBuffer_lock.Unlock();
+                    if(settle || grant%4==0)
+                        AudioBuffer_drained.wait_for(lock, nap);
+                    lock.unlock();
+                    settle = UI.CheckTetris();
+                    lock.lock();
                 }
             }
         #else

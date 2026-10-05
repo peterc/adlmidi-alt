@@ -11,15 +11,6 @@ typedef unsigned short Uint16;
 typedef unsigned Uint32;
 #else
 # include <SDL.h>
-class MutexType
-{
-    SDL_mutex* mut;
-public:
-    MutexType() : mut(SDL_CreateMutex()) { }
-    ~MutexType() { SDL_DestroyMutex(mut); }
-    void Lock() { SDL_mutexP(mut); }
-    void Unlock() { SDL_mutexV(mut); }
-};
 #endif
 
 extern const struct adldata
