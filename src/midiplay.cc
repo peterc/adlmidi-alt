@@ -1403,17 +1403,21 @@ class MIDIplay
     std::map<unsigned, std::string> track_names;
 
     // Persistent settings for each MIDI channel
-    struct MIDIchannel
+    struct MIDIchannelSettings
     {
-        unsigned short portamento;
-        unsigned char bank_lsb, bank_msb;
-        unsigned char patch;
-        unsigned char volume, expression;
-        unsigned char panning, vibrato, sustain;
-        double bend, bendsense;
-        double vibpos, vibspeed, vibdepth;
-        long   vibdelay;
-        unsigned char lastlrpn,lastmrpn; bool nrpn;
+        unsigned short portamento = 0;
+        unsigned char bank_lsb = 0, bank_msb = 0;
+        unsigned char patch = 0;
+        unsigned char volume = 100, expression = 100;
+        unsigned char panning = 0x30, vibrato = 0, sustain = 0;
+        double bend = 0.0, bendsense = 2 / 8192.0;
+        double vibpos = 0, vibspeed = 2*3.141592653*5.0, vibdepth = 0.5/127;
+        long   vibdelay = 0;
+        unsigned char lastlrpn = 0, lastmrpn = 0; bool nrpn = false;
+    };
+    // The settings, plus the notes the channel is currently playing
+    struct MIDIchannel: MIDIchannelSettings
+    {
         struct NoteInfo
         {
             // Current pressure
@@ -1432,19 +1436,9 @@ class MIDIplay
         typedef std::map<unsigned char,NoteInfo> activenotemap_t;
         typedef activenotemap_t::iterator activenoteiterator;
         activenotemap_t activenotes;
-
-        MIDIchannel()
-            : portamento(0),
-              bank_lsb(0), bank_msb(0), patch(0),
-              volume(100),expression(100),
-              panning(0x30), vibrato(0), sustain(0),
-              bend(0.0), bendsense(2 / 8192.0),
-              vibpos(0), vibspeed(2*3.141592653*5.0),
-              vibdepth(0.5/127), vibdelay(0),
-              lastlrpn(0),lastmrpn(0),nrpn(false),
-              activenotes() { }
     };
     std::vector<MIDIchannel> Ch;
+    std::vector<MIDIchannelSettings> LoopBeginSettings; // Goes with LoopBeginPosition
     bool cmf_percussion_mode = false;
 
     // Additional information about AdLib channels
@@ -1962,6 +1956,7 @@ private:
         if(loopStart)
         {
             LoopBeginPosition = RowBeginPosition;
+            LoopBeginSettings.assign(Ch.begin(), Ch.end());
             loopStart = false;
         }
         if(shortest < 0 || loopEnd)
@@ -1970,6 +1965,17 @@ private:
             loopEnd         = false;
             CurrentPosition = LoopBeginPosition;
             shortest        = 0;
+
+            // Songs often end with notes still held, and with pitch bend,
+            // expression etc. wherever the ending left them. Release the
+            // notes and begin the next pass with the settings this one had.
+            for(unsigned MidCh = 0; MidCh < Ch.size(); ++MidCh)
+                NoteUpdate_All(MidCh, Upd_Off);
+            KillSustainingNotes();
+            for(std::size_t MidCh = 0; MidCh < Ch.size(); ++MidCh)
+                static_cast<MIDIchannelSettings&>(Ch[MidCh]) =
+                    MidCh < LoopBeginSettings.size() ? LoopBeginSettings[MidCh]
+                                                     : MIDIchannelSettings(); // Channel added later
 
             /* If the -nl commandline option was given, quit now */
             if(QuitWithoutLooping)
