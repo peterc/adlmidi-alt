@@ -411,7 +411,7 @@ public:
     static constexpr unsigned VidWidth  = 1216, VidHeight = 2160;
     static constexpr unsigned FontWidth =   20, FontHeight = 45;
     static constexpr unsigned TxWidth   = (VidWidth/FontWidth), TxHeight = (VidHeight/FontHeight);
-    unsigned int   PixelBuffer[VidWidth*VidHeight] = {0};
+    std::vector<unsigned> PixelBuffer; // Allocated by the first VidRender()
     unsigned short CharBuffer[TxWidth*TxHeight] = {0};
     bool           DirtyCells[TxWidth*TxHeight] = {false};
     unsigned       NDirty = 0;
@@ -671,7 +671,7 @@ public:
         unsigned bg = VidTranslateColor(attr >> 4), fg = VidTranslateColor(attr);
         for(unsigned line=0; line<FontHeight; ++line)
         {
-            unsigned int* pix = PixelBuffer + (y*FontHeight+line)*VidWidth + x*FontWidth;
+            unsigned int* pix = PixelBuffer.data() + (y*FontHeight+line)*VidWidth + x*FontWidth;
 
             unsigned char bm = bitmap[line*15/FontHeight];
             for(unsigned w=0; w<FontWidth; ++w)
@@ -692,6 +692,7 @@ public:
     void VidRender()
     {
         static const font9x15 font;
+        if(PixelBuffer.empty()) PixelBuffer.resize(VidWidth*VidHeight);
         if(NDirty)
         {
             #pragma omp parallel for schedule(static)
@@ -3258,8 +3259,8 @@ static void SendStereoAudio(unsigned long count, int* samples)
             {
                 UI.VidRender();
 
-                const unsigned char* source = (const unsigned char*)&UI.PixelBuffer;
-                std::size_t bytes_remain    = sizeof(UI.PixelBuffer);
+                const unsigned char* source = (const unsigned char*)UI.PixelBuffer.data();
+                std::size_t bytes_remain    = UI.PixelBuffer.size() * sizeof(UI.PixelBuffer[0]);
                 while(bytes_remain)
                 {
                     int r = std::fwrite(source, 1, bytes_remain, fp);
