@@ -44,6 +44,20 @@ The puzzle game is disabled by default. To enable it:
 
 Press `q`, Escape, or Ctrl-C to stop playback and restore the terminal.
 
+Pass a folder to play its `.mid`, `.midi`, and `.rmi` files in alphabetical
+filename order (extensions are case insensitive; subfolders are not scanned):
+
+```sh
+./adlmidi /path/to/midi-folder
+```
+
+Use Left and Right arrows for the previous and next file, wrapping at either
+end. Songs advance automatically when they finish, and the folder repeats by
+default. Add `-nl` to stop after the last file. Files that cannot be loaded are
+skipped. The current filename and position (for example `[2/12] song.mid`) stay
+visible at the top, including after resizing. Folder mode is for live playback;
+WAV/video exports and the instrument tester still require a single filename.
+
 Playback defaults to bank 1 (Bisqwit) and four OPL3 cards, with four-op voices
 allocated automatically for the selected bank. Bank 1 gets 16 four-op and 40
 two-op voices. Bank 0 remains available with `./adlmidi song.mid 0`.
@@ -64,7 +78,7 @@ names from the MIDI file are used when available, with General MIDI names as
 the fallback.
 The layout adjusts when you resize the terminal; resizing restarts the puzzle.
 The puzzle is hidden automatically in terminals smaller than 50 columns or
-29 rows. Font choice remains controlled by your terminal settings.
+30 rows. Font choice remains controlled by your terminal settings.
 
 OpenMP is enabled automatically when the compiler supports it; Apple's Clang
 builds without it. The macOS compatibility changes come from
@@ -73,13 +87,13 @@ builds without it. The macOS compatibility changes come from
 ## Usage
 
 ```
-Usage: adlmidi <midifilename> [ <options> ] [ <banknumber> [ <numcards> [ <numfourops>] ] ]
+Usage: adlmidi <midifilename-or-folder> [ <options> ] [ <banknumber> [ <numcards> [ <numfourops>] ] ]
        adlmidi <midifilename> -1   To enter instrument tester
  -p Enables adlib percussion instrument mode (use with CMF files)
  -t Enables tremolo amplification mode
  -v Enables vibrato amplification mode
  -s Enables scaling of modulator volumes
- -nl Quit without looping
+ -nl Quit after one song, or one pass through a folder
  -game Show the puzzle game (disabled by default)
  -no-game Hide the puzzle game
  -gain <dB> Output gain in dB (-60..30, default: 12)

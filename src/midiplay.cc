@@ -22,6 +22,8 @@
 #include <chrono>
 #include <atomic>
 #include <array>
+#include <filesystem>
+#include <cctype>
 #include <mutex>
 #include <condition_variable>
 
@@ -78,6 +80,8 @@ static bool FakeDOSshell = false;
 static unsigned SkipForward = 0;
 static bool DoingInstrumentTesting = false;
 static bool QuitWithoutLooping = false;
+static bool FolderPlayback = false;
+static int TrackChange = 0;
 static bool ShowPuzzleGame = false;
 static double OutputGainDb = 12.0;
 static bool WritePCMfile = false;
@@ -336,7 +340,13 @@ public:
     char PeekInput()
     {
 #ifdef __DJGPP__
-        if(kbhit()) { int c = getch(); return c ? c : getch(); }
+        if(kbhit())
+        {
+            int c = getch();
+            if(c) return c;
+            c = getch();
+            return c == 77 ? 1 : c == 75 ? 2 : 0;
+        }
 #endif
 #ifdef __WIN32__
         DWORD nread=0;
@@ -349,7 +359,7 @@ public:
             {
                 char c = inbuf[0].Event.KeyEvent.uChar.AsciiChar;
                 unsigned s = inbuf[0].Event.KeyEvent.wVirtualScanCode;
-                if(c == 0) c = s;
+                if(c == 0) c = s == 77 ? 1 : s == 75 ? 2 : 0;
                 return c;
         }   }
 #endif
@@ -367,7 +377,12 @@ public:
             // rather than treating its leading byte as a request to quit.
             if(escape_state == EscapeState::Sequence)
             {
-                if(c >= 0x40 && c <= 0x7E) escape_state = EscapeState::None;
+                if(c >= 0x40 && c <= 0x7E)
+                {
+                    if(FolderPlayback && c == 'C') TrackChange = 1;
+                    if(FolderPlayback && c == 'D') TrackChange = -1;
+                    escape_state = EscapeState::None;
+                }
                 continue;
             }
             if(escape_state == EscapeState::Pending)
@@ -379,6 +394,10 @@ public:
                     continue;
                 }
             }
+#if defined(__WIN32__) || defined(__DJGPP__)
+            if(FolderPlayback && c == 1) { TrackChange = 1; continue; }
+            if(FolderPlayback && c == 2) { TrackChange = -1; continue; }
+#endif
             if(c == 'q' || c == 3) return true;
             if(c == 27)
             {
@@ -475,13 +494,13 @@ public:
 #ifndef SUPPORT_PUZZLE_GAME
         return false;
 #else
-        return ShowPuzzleGame && (!TerminalActive || (WinHeight() >= 28 && Columns() >= 50));
+        return ShowPuzzleGame && (!TerminalActive || (WinHeight() >= 29 && Columns() >= 50));
 #endif
     }
     unsigned LogHeight() const
     {
         if(!TerminalActive) return WinHeight();
-        return std::min(3u, std::max(2u, WinHeight() - (GameVisible() ? 25u : 1u)));
+        return std::min(4u, std::max(3u, WinHeight() - (GameVisible() ? 25u : 1u)));
     }
     unsigned LabelLeft() const { return TerminalActive && GameVisible() ? 32u : 2u; }
     unsigned LabelWidth() const
@@ -545,6 +564,29 @@ public:
             Draw(NoteColumn(entry.first.second), row, AllocateColor(n.ins & 255), c);
         }
     }
+    std::string playing_file;
+    void DrawHeader()
+    {
+        if(!TerminalActive) return;
+        std::string lines[2] = {
+            "ADLMIDI-ALT | " + playing_file,
+            FolderPlayback ? "Left / Right: prev / next | q / Esc / Ctrl-C: quit"
+                           : "q / Esc / Ctrl-C: quit"
+        };
+        for(unsigned row=0; row<2; ++row)
+            for(unsigned col=0; col<Columns(); ++col)
+            {
+                unsigned char c = col < lines[row].size() ? lines[row][col] : ' ';
+                Draw(col, row, 15, c >= 32 && c < 127 ? c : '?');
+            }
+        std::fflush(stderr);
+    }
+    void SetPlayingFile(const std::string& filename, std::size_t index, std::size_t count)
+    {
+        playing_file = (FolderPlayback ? "[" + std::to_string(index+1) + "/"
+            + std::to_string(count) + "] " : "") + filename;
+        DrawHeader();
+    }
     unsigned LayoutGeneration = 0;
     void BeginScreen()
     {
@@ -573,7 +615,7 @@ public:
         RawPrn("\33[2J\33[H");
         x = y = maxy = 0;
         color = -1;
-        txtline = 0;
+        txtline = 2;
         std::memset(slots, '.', sizeof(slots));
         std::memset(background, '.', sizeof(background));
         std::memset(backgroundcolor, 1, sizeof(backgroundcolor));
@@ -588,7 +630,7 @@ public:
                 Color(1);
                 PutC(background[col][row]);
             }
-        Print(0, 15, true, "ADLMIDI  |  q / Esc / Ctrl-C to quit");
+        DrawHeader();
         for(unsigned channel: visual_order) DrawChannelNotes(channel);
         std::fflush(stderr);
     }
@@ -721,7 +763,8 @@ public:
           if(TerminalActive)
           {
               if(x >= 0 && x < int(Columns()) && y >= 0 && y < int(WinHeight()))
-                  std::fputc(c == '.' && x%4 != 0 ? ' ' : c, stderr);
+                  std::fputc(c == '.' && y >= int(LogHeight()) && x >= int(NoteLeft())
+                      && x%4 != 0 ? ' ' : c, stderr);
           }
       #endif
         }
@@ -753,7 +796,7 @@ public:
         int nchars = std::vsprintf(Line, fmt, ap); /* SECURITY: POSSIBLE BUFFER OVERFLOW (Cygwin) */
       #endif
         nchars = std::max(0, std::min(nchars, int(sizeof(Line)-1)));
-        if(TerminalActive) txtline %= LogHeight();
+        if(TerminalActive) txtline = 2 + (txtline >= 2 ? txtline-2 : 0) % (LogHeight()-2);
 
         HideCursor();
         for(unsigned tx = beginx; tx < Columns(); ++tx)
@@ -783,7 +826,7 @@ public:
         if(ln)
         {
             txtline = TerminalActive
-                ? 1 + txtline % (LogHeight()-1)
+                ? 2 + (txtline-1) % (LogHeight()-2)
                 : (txtline + 1) % WinHeight();
         }
 
@@ -1492,6 +1535,7 @@ class MIDIplay
 public:
     fraction<long> InvDeltaTicks, Tempo;
     bool loopStart, loopEnd;
+    bool finished = false;
     OPL3 opl;
 public:
     static unsigned long ReadBEint(const void* buffer, unsigned nbytes)
@@ -1758,6 +1802,7 @@ public:
                     CurrentPosition.track[tk].delay = ReadVarLen(tk);
             }
         }
+        std::fclose(fp);
         loopStart = true;
 
         opl.Reset(); // Reset AdLib
@@ -1775,7 +1820,7 @@ public:
     double Tick(double s, double granularity)
     {
         if(CurrentPosition.began) CurrentPosition.wait -= s;
-        while(CurrentPosition.wait <= granularity * 0.5)
+        while(!finished && CurrentPosition.wait <= granularity * 0.5)
         {
             //std::fprintf(stderr, "wait = %g...\n", CurrentPosition.wait);
             ProcessEvents();
@@ -1959,7 +2004,12 @@ private:
             LoopBeginSettings.assign(Ch.begin(), Ch.end());
             loopStart = false;
         }
-        if(shortest < 0 || loopEnd)
+        if(FolderPlayback && shortest < 0)
+        {
+            finished = true;
+            return;
+        }
+        if(shortest < 0 || (loopEnd && !FolderPlayback))
         {
             // Loop if song end reached
             loopEnd         = false;
@@ -2799,6 +2849,7 @@ static struct MyReverbData
         enabled = ReverbSpecs.byname.do_reverb > 0;
         for(std::size_t i=0; i<2; ++i)
         {
+            chan[i] = Reverb();
             chan[i].Create(PCM_RATE,
                 ReverbSpecs.byname.wet_gain_db,
                 ReverbSpecs.byname.room_scale,
@@ -3106,6 +3157,8 @@ public:
 };
 static WavWriter WavOutput;
 
+static float PreviousAudioInput[2] = {0,0}, PreviousAudioOutput[2] = {0,0};
+
 static void SendStereoAudio(unsigned long count, int* samples)
 {
     if(count > MaxSamplesAtTime)
@@ -3166,7 +3219,6 @@ static void SendStereoAudio(unsigned long count, int* samples)
 #endif
 
     // Remove DC before reverb so offsets do not consume its headroom.
-    static float previous_input[2] = {0,0}, previous_output[2] = {0,0};
     static const float dc_pole = std::exp(-2.0 * 3.141592653589793 * 5.0 / PCM_RATE);
     std::vector<float> dry[2];
     for(unsigned w=0; w<2; ++w)
@@ -3175,9 +3227,9 @@ static void SendStereoAudio(unsigned long count, int* samples)
         for(unsigned long p = 0; p < count; ++p)
         {
             float input = samples[p*2+w];
-            float filtered = input - previous_input[w] + dc_pole * previous_output[w];
-            previous_input[w] = input;
-            previous_output[w] = filtered;
+            float filtered = input - PreviousAudioInput[w] + dc_pole * PreviousAudioOutput[w];
+            PreviousAudioInput[w] = input;
+            PreviousAudioOutput[w] = filtered;
             dry[w][p] = filtered * double(0.3/32768.0);
         }
         // ^  Note: ftree-vectorize causes an error in this loop on g++-4.4.5
@@ -3527,13 +3579,14 @@ int main(int argc, char** argv)
     {
         UI.Color(7);  std::fflush(stderr);
         std::printf(
-            "Usage: adlmidi <midifilename> [ <options> ] [ <banknumber> [ <numcards> [ <numfourops>] ] ]\n"
+            "Usage: adlmidi <midifilename-or-folder> [ <options> ] [ <banknumber> [ <numcards> [ <numfourops>] ] ]\n"
             "       adlmidi <midifilename> -1   To enter instrument tester\n"
             " -p              Enables adlib percussion instrument mode (use with CMF files)\n"
             " -t              Enables tremolo amplification mode\n"
             " -v              Enables vibrato amplification mode\n"
             " -s              Enables scaling of modulator volumes\n"
-            " -nl             Quit without looping\n"
+            " Folders: play .mid/.midi/.rmi files alphabetically; Left/Right selects prev/next.\n"
+            " -nl             Quit after one song, or one pass through a folder\n"
             " -game           Show the puzzle game (disabled by default)\n"
             " -no-game        Hide the puzzle game\n"
 #ifndef __DJGPP__
@@ -3758,11 +3811,72 @@ int main(int argc, char** argv)
         UI.PrintLn("%s", s.c_str());
     }
 
-    MIDIplay player;
-    player.ChooseDevice("");
+    std::vector<std::filesystem::path> playlist;
+    std::error_code folder_error;
+    FolderPlayback = std::filesystem::is_directory(argv[1], folder_error);
+    if(FolderPlayback)
+    {
+        if(WritePCMfile || DoingInstrumentTesting
+#ifdef SUPPORT_VIDEO_OUTPUT
+            || WriteVideoFile
+#endif
+        )
+        {
+            std::fprintf(stderr, "Folder playback is available for live playback only.\n");
+            return 2;
+        }
+        std::filesystem::directory_iterator entries(argv[1], folder_error), end;
+        for(; !folder_error && entries != end; entries.increment(folder_error))
+        {
+            std::error_code file_error;
+            if(!entries->is_regular_file(file_error)) continue;
+            std::string extension = entries->path().extension().string();
+            for(char& c: extension) c = std::tolower(static_cast<unsigned char>(c));
+            if(extension == ".mid" || extension == ".midi" || extension == ".rmi")
+                playlist.push_back(entries->path());
+        }
+        if(folder_error)
+        {
+            std::fprintf(stderr, "%s: %s\n", argv[1], folder_error.message().c_str());
+            return 2;
+        }
+        std::sort(playlist.begin(), playlist.end());
+        if(playlist.empty())
+        {
+            std::fprintf(stderr, "%s: No MIDI files found (.mid, .midi, .rmi).\n", argv[1]);
+            return 2;
+        }
+    }
+    else playlist.emplace_back(argv[1]);
 
+    MIDIplay player;
+    std::size_t current_track = 0;
+    // Construct a fresh player for each file, including failed load attempts.
+    auto load_track = [&](int direction)
+    {
+        for(std::size_t attempts=0; attempts<playlist.size(); ++attempts)
+        {
+            MIDIplay next;
+            next.ChooseDevice("");
+            if(next.LoadMIDI(playlist[current_track].string()))
+            {
+                player = std::move(next);
+                UI.visual_channels.clear();
+                UI.visual_order.clear();
+                UI.SetPlayingFile(playlist[current_track].filename().string(), current_track, playlist.size());
+                UI.Reflow();
+                return true;
+            }
+            UI.PrintLn("Skipping unreadable file: %s", playlist[current_track].filename().string().c_str());
+            if(!FolderPlayback) break;
+            if(direction > 0 && QuitWithoutLooping && current_track+1 == playlist.size()) break;
+            current_track = direction < 0 ? (current_track+playlist.size()-1)%playlist.size()
+                                          : (current_track+1)%playlist.size();
+        }
+        return false;
+    };
     UI.Color(7);
-    if(!player.LoadMIDI(argv[1]))
+    if(!load_track(1))
     {
         UI.ShowCursor();
         return 2;
@@ -3818,14 +3932,39 @@ int main(int argc, char** argv)
     Tester InstrumentTester(player.opl);
 
     UI.TetrisLaunched = true;
+    double carry = 0.0;
     for(double delay=0; !QuitFlag; )
     {
         if(!DoingInstrumentTesting && Input.StopRequested()) break;
+        if(FolderPlayback && (TrackChange || player.finished))
+        {
+            bool automatic = !TrackChange;
+            int direction = TrackChange ? TrackChange : 1;
+            TrackChange = 0;
+            if(automatic && QuitWithoutLooping && current_track+1 == playlist.size()) break;
+            current_track = direction < 0 ? (current_track+playlist.size()-1)%playlist.size()
+                                          : (current_track+1)%playlist.size();
+#ifndef __DJGPP__
+#ifndef __WIN32__
+            if(!automatic)
+            {
+                std::lock_guard lock(AudioBuffer_lock);
+                AudioBuffer.clear();
+            }
+#endif
+            reverb_data.ReInit();
+            std::fill_n(PreviousAudioInput, 2, 0.f);
+            std::fill_n(PreviousAudioOutput, 2, 0.f);
+#endif
+            if(!load_track(direction)) break;
+            delay = 0;
+            carry = 0;
+            SkipForward = 0;
+        }
     #ifndef __DJGPP__
         const double eat_delay = delay < maxdelay ? delay : maxdelay;
         delay -= eat_delay;
 
-        static double carry = 0.0;
         carry += PCM_RATE * eat_delay;
         const unsigned long n_samples = (unsigned) carry;
         carry -= n_samples;
@@ -3884,7 +4023,7 @@ int main(int argc, char** argv)
                 const std::chrono::milliseconds nap(UI.GameVisible() ? 1 : 20);
                 bool settle = true;
                 std::unique_lock lock(AudioBuffer_lock);
-                for(unsigned grant=0; !QuitFlag && AudioBuffer.size() > high_water; ++grant)
+                for(unsigned grant=0; !QuitFlag && !TrackChange && AudioBuffer.size() > high_water; ++grant)
                 {
                     if(settle || grant%4==0)
                         AudioBuffer_drained.wait_for(lock, nap);
@@ -3912,6 +4051,7 @@ int main(int argc, char** argv)
         PrevTimer = CurTimer;
     #endif
 
+        if(TrackChange) continue;
         double nextdelay =
             DoingInstrumentTesting
             ? InstrumentTester.Tick(eat_delay, mindelay)
