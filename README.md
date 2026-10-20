@@ -1,9 +1,9 @@
 # adlmidi (peterc's version)
 ADLMIDI is a MIDI player, created by Joel Yliluoma, that uses OPL3 emulation. This is a fork with a few modernizations to run and render well on macOS, and to set some sound defaults that, I think, sound better if you want the true bisqwit YouTube background music vibe.
 
-It still kinda looks like this, but imagine macOS instead:
+Running on macOS:
 
-![https://bisqwit.iki.fi/jutut/kuvat/programming_examples/midiplay.gif](https://bisqwit.iki.fi/jutut/kuvat/programming_examples/midiplay.gif)
+![ADLMIDI playing a MIDI file in the macOS terminal](screenshot.png)
 
 ## Key features
 
