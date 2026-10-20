@@ -58,6 +58,12 @@ skipped. The current filename and position (for example `[2/12] song.mid`) stay
 visible at the top, including after resizing. Folder mode is for live playback;
 WAV/video exports and the instrument tester still require a single filename.
 
+Natural song endings release held notes and render a two-second decay tail
+before advancing or stopping, including in WAV exports. Live playback drains
+queued audio before closing. MIDI files without a tempo event default to
+120 quarter notes per minute. Malformed files are rejected with an error;
+folder playback skips them. Input files are limited to 64 MiB.
+
 Playback defaults to bank 1 (Bisqwit) and four OPL3 cards, with four-op voices
 allocated automatically for the selected bank. Bank 1 gets 16 four-op and 40
 two-op voices. Bank 0 remains available with `./adlmidi song.mid 0`.
@@ -70,6 +76,9 @@ output boost. The range is -60 to +30 dB. Soft peak limiting protects loud
 passages, and reverb adds ambience while preserving the direct instrument sound.
 Reverb gain defaults to +24 dB; use `-reverb gain=18` to reduce its level,
 or `-nr` to disable reverb.
+Reverb `room`, `factor`, `damping`, and `stereo` values must be between 0 and 1;
+`predelay` accepts 0 to 0.5 seconds and `gain` accepts -60 to +60 dB.
+Use `-reverb stereo=0` for mono reverb. Invalid options and values are errors.
 
 Playback uses the terminal's alternate screen with a black background and fixed
 RGB colours. Metadata, the single puzzle board, and notes have separate areas.

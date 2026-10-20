@@ -26,6 +26,9 @@
 #include <cctype>
 #include <mutex>
 #include <condition_variable>
+#include <cerrno>
+#include <stdexcept>
+#include <limits>
 
 #include <assert.h>
 
@@ -201,7 +204,7 @@ static const unsigned DynamicInstrumentTag = 0x8000u, DynamicMetaInstrumentTag =
 static const adlinsdata& GetAdlMetaIns(unsigned n)
 {
     return (n & DynamicMetaInstrumentTag)
-        ? dynamic_metainstruments[n & ~DynamicMetaInstrumentTag]
+        ? dynamic_metainstruments.at(n & ~DynamicMetaInstrumentTag)
         : adlins[n];
 }
 static unsigned GetAdlMetaNumber(unsigned midiins)
@@ -213,7 +216,7 @@ static unsigned GetAdlMetaNumber(unsigned midiins)
 static const adldata& GetAdlIns(unsigned short insno)
 {
     return (insno & DynamicInstrumentTag)
-        ? dynamic_instruments[insno & ~DynamicInstrumentTag]
+        ? dynamic_instruments.at(insno & ~DynamicInstrumentTag)
         : adl[insno];
 }
 
@@ -1421,6 +1424,87 @@ public:
     }
 };
 
+// All file offsets and MIDI event lengths pass through these bounded readers.
+// Keeping the file in memory also prevents corrupt track lengths from causing
+// allocations larger than the input itself.
+class MIDIFileReader
+{
+    std::vector<unsigned char> bytes;
+    std::size_t pos = 0;
+public:
+    explicit MIDIFileReader(const std::string& filename)
+    {
+        std::unique_ptr<std::FILE, decltype(&std::fclose)> fp(
+            std::fopen(filename.c_str(), "rb"), std::fclose);
+        if(!fp) throw std::runtime_error(std::strerror(errno));
+        if(std::fseek(fp.get(), 0, SEEK_END) != 0)
+            throw std::runtime_error("Cannot seek input file");
+        long length = std::ftell(fp.get());
+        if(length < 0 || length > 64*1024*1024)
+            throw std::runtime_error("Input exceeds the 64 MiB file limit");
+        std::rewind(fp.get());
+        bytes.resize(length);
+        if(std::fread(bytes.data(), 1, bytes.size(), fp.get()) != bytes.size())
+            throw std::runtime_error("Cannot read complete input file");
+    }
+    std::size_t Tell() const { return pos; }
+    std::size_t Remaining() const { return bytes.size() - pos; }
+    void Limit(std::size_t end)
+    {
+        if(end < pos || end > bytes.size()) throw std::runtime_error("Invalid file boundary");
+        bytes.resize(end);
+    }
+    void Seek(long offset, int origin)
+    {
+        long base = origin == SEEK_SET ? 0 : origin == SEEK_CUR ? pos : bytes.size();
+        if(offset < -base || offset > long(bytes.size()) - base)
+            throw std::runtime_error("File offset outside input");
+        pos = base + offset;
+    }
+    void Read(void* target, std::size_t length)
+    {
+        if(length > Remaining()) throw std::runtime_error("Truncated input file");
+        if(length) std::memcpy(target, bytes.data() + pos, length);
+        pos += length;
+    }
+    unsigned char Byte()
+    {
+        unsigned char result;
+        Read(&result, 1);
+        return result;
+    }
+};
+
+class MIDITrackReader
+{
+    const std::vector<unsigned char>& bytes;
+    std::size_t& pos;
+public:
+    MIDITrackReader(const std::vector<unsigned char>& data, std::size_t& position)
+        : bytes(data), pos(position) {}
+    std::string_view Take(std::size_t length)
+    {
+        if(pos > bytes.size() || length > bytes.size() - pos)
+            throw std::runtime_error("Truncated MIDI event");
+        if(!length) return {};
+        const char* start = reinterpret_cast<const char*>(bytes.data() + pos);
+        pos += length;
+        return {start, length};
+    }
+    unsigned char Byte() { return static_cast<unsigned char>(Take(1)[0]); }
+    unsigned long VarLen()
+    {
+        unsigned long value = 0;
+        for(unsigned n=0; n<4; ++n)
+        {
+            unsigned char byte = Byte();
+            value = (value << 7) | (byte & 0x7F);
+            if(!(byte & 0x80)) return value;
+        }
+        throw std::runtime_error("MIDI variable-length value exceeds four bytes");
+    }
+};
+
 class MIDIplay
 {
     // Information about each track
@@ -1470,7 +1554,7 @@ class MIDIplay
             // Patch selected on noteon; index to banks[AdlBank][]
             unsigned char midiins;
             // Index to physical adlib data structure, adlins[]
-            unsigned short insmeta;
+            unsigned insmeta;
             // List of adlib channels it is currently occupying.
             std::map<unsigned short/*adlchn*/,
                      unsigned short/*ins, inde to adl[]*/
@@ -1532,10 +1616,18 @@ class MIDIplay
     std::vector<AdlChannel> ch;
 
     std::vector< std::vector<unsigned char> > TrackData;
+    bool imf_events = false;
+    bool ending = false;
+    bool has_sound = false;
+    double tail_remaining = 0;
+    double loop_elapsed = 0;
+    fraction<long> LoopBeginTempo;
+    std::string source_name;
 public:
     fraction<long> InvDeltaTicks, Tempo;
     bool loopStart, loopEnd;
     bool finished = false;
+    bool failed = false;
     OPL3 opl;
 public:
     static unsigned long ReadBEint(const void* buffer, unsigned nbytes)
@@ -1551,31 +1643,121 @@ public:
         unsigned long result=0;
         const unsigned char* data = (const unsigned char*) buffer;
         for(unsigned n=0; n<nbytes; ++n)
-            result = result + (data[n] << (n*8));
+            result = result + (static_cast<unsigned long>(data[n]) << (n*8));
         return result;
     }
     unsigned long ReadVarLen(unsigned tk)
     {
-        unsigned long result = 0;
-        for(;;)
-        {
-            unsigned char byte = TrackData[tk][CurrentPosition.track[tk].ptr++];
-            result = (result << 7) + (byte & 0x7F);
-            if(!(byte & 0x80)) break;
-        }
-        return result;
+        return MIDITrackReader(TrackData[tk], CurrentPosition.track[tk].ptr).VarLen();
     }
 
-    bool LoadMIDI(const std::string& filename)
+    struct Event
     {
-        std::FILE* fp = std::fopen(filename.c_str(), "rb");
-        if(!fp) { std::fprintf(stderr, "\n"); std::perror(filename.c_str()); return false; }
+        unsigned char status, meta = 0;
+        std::string_view data;
+    };
+    Event ReadEvent(std::size_t tk, std::size_t& ptr, int& running_status) const
+    {
+        MIDITrackReader reader(TrackData[tk], ptr);
+        unsigned char status = reader.Byte();
+        if(status < 0x80)
+        {
+            if(running_status < 0x80 || running_status >= 0xF0)
+                throw std::runtime_error("MIDI data without a running status");
+            status = running_status;
+            --ptr;
+        }
+        Event event{status, 0, {}};
+        if(status == 0xFF)
+        {
+            event.meta = reader.Byte();
+            event.data = reader.Take(reader.VarLen());
+            if(event.meta == 0x2F && !event.data.empty())
+                throw std::runtime_error("Invalid end-of-track event");
+            if(event.meta == 0x51)
+            {
+                if(event.data.size() != (imf_events ? 4u : 3u)
+                    || !ReadBEint(event.data.data(), event.data.size()))
+                    throw std::runtime_error("Invalid MIDI tempo");
+            }
+            if(event.meta == 0xE3 && (!imf_events || event.data.size() != 2))
+                throw std::runtime_error("Invalid AdLib register event");
+        }
+        else if(status == 0xF0 || status == 0xF7)
+        {
+            event.data = reader.Take(reader.VarLen());
+            running_status = 0;
+        }
+        else
+        {
+            unsigned length;
+            if(status < 0xF0)
+            {
+                running_status = status;
+                length = ((status >> 4) == 0xC || (status >> 4) == 0xD) ? 1 : 2;
+            }
+            else if(status == 0xF2 || status == 0xF3)
+            {
+                length = status == 0xF2 ? 2 : 1;
+                running_status = 0;
+            }
+            else throw std::runtime_error("Unsupported MIDI status byte");
+            event.data = reader.Take(length);
+            for(unsigned char byte: event.data)
+                if(byte >= 0x80) throw std::runtime_error("Invalid MIDI data byte");
+        }
+        return event;
+    }
+    void ValidateTrack(std::size_t tk, bool first_delta) const
+    {
+        std::size_t ptr = 0;
+        int status = 0;
+        if(TrackData[tk].empty()) throw std::runtime_error("Empty MIDI track");
+        while(ptr < TrackData[tk].size())
+        {
+            if(first_delta) MIDITrackReader(TrackData[tk], ptr).VarLen();
+            first_delta = true;
+            Event event = ReadEvent(tk, ptr, status);
+            if(event.status == 0xFF && event.meta == 0x2F) return;
+        }
+    }
+
+    bool LoadMIDI(const std::string& filename) try
+    {
+        source_name = filename;
+        MIDIFileReader file(filename);
         const unsigned HeaderSize = 4+4+2+2+2; // 14
         char HeaderBuf[HeaderSize]="";
-    riffskip:;
-        std::fread(HeaderBuf, 1, HeaderSize, fp);
+        file.Read(HeaderBuf, HeaderSize);
         if(std::memcmp(HeaderBuf, "RIFF", 4) == 0)
-            { std::fseek(fp, 6, SEEK_CUR); goto riffskip; }
+        {
+            if(std::memcmp(HeaderBuf+8, "RMID", 4) != 0)
+                throw std::runtime_error("RIFF input is not an RMID file");
+            const unsigned long riff_size = ReadLEint(HeaderBuf+4, 4);
+            if(riff_size < 4 || riff_size > file.Remaining()+HeaderSize-8)
+                throw std::runtime_error("Truncated RIFF container");
+            file.Seek(12, SEEK_SET);
+            const std::size_t riff_end = riff_size + 8;
+            bool found = false;
+            while(file.Tell()+8 <= riff_end)
+            {
+                char chunk[8];
+                file.Read(chunk, sizeof(chunk));
+                std::size_t length = ReadLEint(chunk+4, 4);
+                if(length > riff_end-file.Tell())
+                    throw std::runtime_error("Truncated RIFF chunk");
+                if(std::memcmp(chunk, "data", 4) == 0)
+                {
+                    // The MIDI parser must not consume another RIFF chunk.
+                    file.Limit(file.Tell()+length);
+                    file.Read(HeaderBuf, HeaderSize);
+                    found = true;
+                    break;
+                }
+                file.Seek(length + (length & 1), SEEK_CUR);
+            }
+            if(!found) throw std::runtime_error("RMID container has no data chunk");
+        }
         size_t DeltaTicks=192, TrackCount=1;
 
         bool is_GMF = false; // GMD/MUS files (ScummVM)
@@ -1588,7 +1770,7 @@ public:
         if(std::memcmp(HeaderBuf, "GMF\1", 4) == 0)
         {
             // GMD/MUS files (ScummVM)
-            std::fseek(fp, 7-(HeaderSize), SEEK_CUR);
+            file.Seek(7, SEEK_SET);
             is_GMF = true;
         }
         else if(std::memcmp(HeaderBuf, "MUS\1x1A", 4) == 0)
@@ -1596,7 +1778,7 @@ public:
             // MUS/DMX files (Doom)
             unsigned start = ReadLEint(HeaderBuf+8, 2);
             is_MUS = true;
-            std::fseek(fp, int(start-HeaderSize), SEEK_CUR);
+            file.Seek(int(start-HeaderSize), SEEK_CUR);
         }
         else if(std::memcmp(HeaderBuf, "CTMF", 4) == 0)
         {
@@ -1612,17 +1794,21 @@ public:
             //unsigned deltas    = ReadLEint(HeaderBuf+10, 2);
             unsigned ticks     = ReadLEint(HeaderBuf+12, 2);
             // Read title, author, remarks start offsets in file
-            std::fread(HeaderBuf, 1, 6, fp);
+            file.Read(HeaderBuf, 6);
             //unsigned long notes_starts[3] = {ReadLEint(HeaderBuf+0,2),ReadLEint(HeaderBuf+0,4),ReadLEint(HeaderBuf+0,6)};
-            std::fseek(fp, 16, SEEK_CUR); // Skip the channels-in-use table
-            std::fread(HeaderBuf, 1, 4, fp);
+            file.Seek(16, SEEK_CUR); // Skip the channels-in-use table
+            file.Read(HeaderBuf, 4);
             unsigned ins_count =  ReadLEint(HeaderBuf+0, 2);//, basictempo = ReadLEint(HeaderBuf+2, 2);
-            std::fseek(fp, ins_start, SEEK_SET);
+            if(ins_count == 0 || ins_count > 256)
+                throw std::runtime_error("Invalid CMF instrument count");
+            dynamic_instruments.clear();
+            dynamic_metainstruments.clear();
+            file.Seek(ins_start, SEEK_SET);
             //std::printf("%u instruments\n", ins_count);
             for(unsigned i=0; i<ins_count; ++i)
             {
                 unsigned char InsData[16];
-                std::fread(InsData, 1, 16, fp);
+                file.Read(InsData, 16);
                 /*std::printf("Ins %3u: %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X\n",
                     i, InsData[0],InsData[1],InsData[2],InsData[3], InsData[4],InsData[5],InsData[6],InsData[7],
                        InsData[8],InsData[9],InsData[10],InsData[11], InsData[12],InsData[13],InsData[14],InsData[15]);*/
@@ -1652,26 +1838,41 @@ public:
                 dynamic_metainstruments.push_back(adlins);
                 dynamic_instruments.push_back(adl);
             }
-            std::fseek(fp, mus_start, SEEK_SET);
+            file.Seek(mus_start, SEEK_SET);
             TrackCount = 1;
             DeltaTicks = ticks;
             AdlBank    = ~0u; // Ignore AdlBank number, use dynamic banks instead
             //std::printf("CMF deltas %u ticks %u, basictempo = %u\n", deltas, ticks, basictempo);
             LogarithmicVolumes = true;
         }
+        else if(std::memcmp(HeaderBuf, "MThd", 4) == 0)
+        {
+            if(ReadBEint(HeaderBuf+4, 4) != 6 || ReadBEint(HeaderBuf+8, 2) > 1)
+                throw std::runtime_error("Unsupported MIDI header or format");
+            TrackCount = ReadBEint(HeaderBuf+10, 2);
+            DeltaTicks = ReadBEint(HeaderBuf+12, 2);
+            if(!TrackCount || (!ReadBEint(HeaderBuf+8, 2) && TrackCount != 1))
+                throw std::runtime_error("Invalid MIDI track count");
+            if(DeltaTicks & 0x8000)
+                throw std::runtime_error("SMPTE MIDI timing is not supported");
+        }
         else
         {
             // Try parsing as EA RSXX file
-            char rsxxbuf[8];
-            {long p = std::ftell(fp);
-            std::fseek(fp, HeaderBuf[0]-0x10, SEEK_SET);
-            std::fread(rsxxbuf, 6, 1, fp);
-            std::fseek(fp, p, SEEK_SET);}
+            char rsxxbuf[8]{};
+            {long p = file.Tell();
+            long offset = static_cast<unsigned char>(HeaderBuf[0])-0x10;
+            if(offset >= 0 && std::size_t(offset)+6 <= file.Tell()+file.Remaining())
+            {
+                file.Seek(offset, SEEK_SET);
+                file.Read(rsxxbuf, 6);
+            }
+            file.Seek(p, SEEK_SET);}
             if(std::memcmp(rsxxbuf, "rsxx}u", 6) == 0)
             {
                 is_RSXX = true;
                 std::fprintf(stderr, "Detected RSXX format\n");
-                std::fseek(fp, HeaderBuf[0], SEEK_SET);
+                file.Seek(static_cast<unsigned char>(HeaderBuf[0]), SEEK_SET);
                 TrackCount = 1;
                 DeltaTicks = 60;
                 LogarithmicVolumes = true;
@@ -1683,17 +1884,18 @@ public:
                 if(1)
                 {
                     unsigned end = (unsigned char)HeaderBuf[0] + 256*(unsigned char)HeaderBuf[1];
-                    if(!end || (end & 3)) goto not_imf;
+                    if(!end || (end & 3) || end+2 > file.Tell()+file.Remaining())
+                        throw std::runtime_error("Invalid format or truncated IMF data");
 
-                    long backup_pos = std::ftell(fp);
+                    long backup_pos = file.Tell();
                     unsigned sum1 = 0, sum2 = 0;
-                    std::fseek(fp, 2, SEEK_SET);
-                    for(unsigned n=0; n<42; ++n)
+                    file.Seek(2, SEEK_SET);
+                    for(unsigned n=0; n<std::min(42u, end/4); ++n)
                     {
-                        unsigned value1 = std::fgetc(fp); value1 += std::fgetc(fp) << 8; sum1 += value1;
-                        unsigned value2 = std::fgetc(fp); value2 += std::fgetc(fp) << 8; sum2 += value2;
+                        unsigned value1 = file.Byte(); value1 += file.Byte() << 8; sum1 += value1;
+                        unsigned value2 = file.Byte(); value2 += file.Byte() << 8; sum2 += value2;
                     }
-                    std::fseek(fp, backup_pos, SEEK_SET);
+                    file.Seek(backup_pos, SEEK_SET);
                     if(sum1 > sum2)
                     {
                         is_IMF = true;
@@ -1702,25 +1904,18 @@ public:
                 }
 
                 if(!is_IMF)
-                {
-                not_imf:
-                    if(std::memcmp(HeaderBuf, "MThd\0\0\0\6", 8) != 0)
-                    { InvFmt:
-                        std::fclose(fp);
-                        std::fprintf(stderr, "%s: Invalid format\n", filename.c_str());
-                        return false;
-                    }
-                    /*size_t  Fmt =*/ ReadBEint(HeaderBuf+8,  2);
-                    TrackCount = ReadBEint(HeaderBuf+10, 2);
-                    DeltaTicks = ReadBEint(HeaderBuf+12, 2);
-                }
+                    throw std::runtime_error("Invalid format");
             }
         }
+        if(!DeltaTicks) throw std::runtime_error("MIDI time division must be nonzero");
+        imf_events = is_IMF;
         TrackData.resize(TrackCount);
         CurrentPosition.track.resize(TrackCount);
         InvDeltaTicks = fraction<long>(1, 1000000l * DeltaTicks);
-        //Tempo       = 1000000l * InvDeltaTicks;
-        Tempo         = fraction<long>(1,            DeltaTicks);
+        // SMF defaults to 500,000 microseconds per quarter note. Legacy formats
+        // use their own tick rates instead.
+        Tempo = (is_GMF || is_MUS || is_IMF || is_CMF || is_RSXX)
+              ? fraction<long>(1, DeltaTicks) : fraction<long>(1, 2*DeltaTicks);
 
         static const unsigned char EndTag[4] = {0xFF,0x2F,0x00,0x00};
 
@@ -1731,7 +1926,7 @@ public:
             if(is_IMF)
             {
                 //std::fprintf(stderr, "Reading IMF file...\n");
-                long end = (unsigned char)HeaderBuf[0] + 256*(unsigned char)HeaderBuf[1];
+                std::size_t end = 2 + (unsigned char)HeaderBuf[0] + 256*(unsigned char)HeaderBuf[1];
 
                 unsigned IMF_tempo = 1428;
                 static const unsigned char imf_tempo[] = {0xFF,0x51,0x4,
@@ -1742,16 +1937,16 @@ public:
                 TrackData[tk].insert(TrackData[tk].end(), imf_tempo, imf_tempo + sizeof(imf_tempo));
                 TrackData[tk].push_back(0x00);
 
-                std::fseek(fp, 2, SEEK_SET);
-                while(std::ftell(fp) < end)
+                file.Seek(2, SEEK_SET);
+                while(file.Tell() < end)
                 {
                     unsigned char special_event_buf[5];
                     special_event_buf[0] = 0xFF;
                     special_event_buf[1] = 0xE3;
                     special_event_buf[2] = 0x02;
-                    special_event_buf[3] = std::fgetc(fp); // port index
-                    special_event_buf[4] = std::fgetc(fp); // port value
-                    unsigned delay = std::fgetc(fp); delay += 256 * std::fgetc(fp);
+                    special_event_buf[3] = file.Byte(); // port index
+                    special_event_buf[4] = file.Byte(); // port value
+                    unsigned delay = file.Byte(); delay += 256 * file.Byte();
 
                     //if(special_event_buf[3] <= 8) continue;
 
@@ -1772,44 +1967,54 @@ public:
             {
                 if(is_GMF || is_CMF || is_RSXX) // Take the rest of the file
                 {
-                    long pos = std::ftell(fp);
-                    std::fseek(fp, 0, SEEK_END);
-                    TrackLength = ftell(fp) - pos;
-                    std::fseek(fp, pos, SEEK_SET);
+                    long pos = file.Tell();
+                    file.Seek(0, SEEK_END);
+                    TrackLength = file.Tell() - pos;
+                    file.Seek(pos, SEEK_SET);
                 }
                 else if(is_MUS) // Read TrackLength from file position 4
                 {
-                    long pos = std::ftell(fp);
-                    std::fseek(fp, 4, SEEK_SET);
-                    TrackLength = std::fgetc(fp); TrackLength += (std::fgetc(fp) << 8);
-                    std::fseek(fp, pos, SEEK_SET);
+                    long pos = file.Tell();
+                    file.Seek(4, SEEK_SET);
+                    TrackLength = file.Byte(); TrackLength += (file.Byte() << 8);
+                    file.Seek(pos, SEEK_SET);
                 }
                 else // Read MTrk header
                 {
-                    std::fread(HeaderBuf, 1, 8, fp);
-                    if(std::memcmp(HeaderBuf, "MTrk", 4) != 0) goto InvFmt;
+                    file.Read(HeaderBuf, 8);
+                    if(std::memcmp(HeaderBuf, "MTrk", 4) != 0)
+                        throw std::runtime_error("Missing MIDI track header");
                     TrackLength = ReadBEint(HeaderBuf+4, 4);
                 }
                 // Read track data
+                if(!TrackLength || TrackLength > file.Remaining())
+                    throw std::runtime_error("Invalid MIDI track length");
                 TrackData[tk].resize(TrackLength);
-                std::fread(&TrackData[tk][0], 1, TrackLength, fp);
+                file.Read(TrackData[tk].data(), TrackLength);
                 if(is_GMF || is_MUS) // Note: CMF does include the track end tag.
                 {
                     TrackData[tk].insert(TrackData[tk].end(), EndTag+0, EndTag+4);
                 }
+                ValidateTrack(tk, !is_RSXX);
                 // Read next event time
                 if(!is_RSXX)
                     CurrentPosition.track[tk].delay = ReadVarLen(tk);
             }
+            if(is_IMF) ValidateTrack(tk, false);
         }
-        std::fclose(fp);
         loopStart = true;
+        CurrentPosition.began = true;
 
         opl.Reset(); // Reset AdLib
         //opl.Reset(); // ...twice (just in case someone misprogrammed OPL3 previously)
         ch.clear();
         ch.resize(opl.NumChannels);
         return true;
+    }
+    catch(const std::exception& error)
+    {
+        std::fprintf(stderr, "%s: %s\n", filename.c_str(), error.what());
+        return false;
     }
 
     /* Periodic tick handler.
@@ -1819,19 +2024,39 @@ public:
      */
     double Tick(double s, double granularity)
     {
-        if(CurrentPosition.began) CurrentPosition.wait -= s;
-        while(!finished && CurrentPosition.wait <= granularity * 0.5)
+        if(ending)
         {
-            //std::fprintf(stderr, "wait = %g...\n", CurrentPosition.wait);
-            ProcessEvents();
+            tail_remaining = std::max(0.0, tail_remaining-s);
+            if(tail_remaining < granularity * 0.5) finished = true;
+            return finished ? 0 : tail_remaining;
+        }
+        if(CurrentPosition.began) CurrentPosition.wait -= s;
+        try
+        {
+            unsigned batches = 0;
+            while(!finished && !ending && !QuitFlag && !TrackChange
+                && CurrentPosition.wait <= granularity * 0.5)
+            {
+                // Bound each visit so even very dense or looping input returns
+                // to the main loop, where keys and signals are handled.
+                if(++batches > 4096) return granularity;
+                ProcessEvents();
+            }
+        }
+        catch(const std::exception& error)
+        {
+            std::fprintf(stderr, "%s: %s\n", source_name.c_str(), error.what());
+            failed = true;
+            BeginEnding();
         }
 
+        if(ending) return tail_remaining;
         for(unsigned c = 0; c < opl.NumChannels; ++c)
             ch[c].AddAge(s * 1000);
 
         UpdateVibrato(s);
         UpdateArpeggio(s);
-        return CurrentPosition.wait;
+        return std::max(0.0, CurrentPosition.wait);
     }
 
 private:
@@ -1841,6 +2066,25 @@ private:
            Upd_Pitch  = 0x8,
            Upd_All    = Upd_Pan + Upd_Volume + Upd_Pitch,
            Upd_Off    = 0x20 };
+
+    void ReleaseNotes()
+    {
+        for(unsigned MidCh=0; MidCh<Ch.size(); ++MidCh)
+        {
+            Ch[MidCh].sustain = 0;
+            NoteUpdate_All(MidCh, Upd_Off);
+        }
+        KillSustainingNotes();
+        // IMF writes registers directly rather than maintaining MIDI notes.
+        for(unsigned c=0; c<opl.NumChannels; ++c) opl.NoteOff(c);
+    }
+    void BeginEnding()
+    {
+        ReleaseNotes();
+        ending = true;
+        tail_remaining = has_sound ? 2.0 : 0.0;
+        finished = tail_remaining == 0;
+    }
 
     void NoteUpdate
         (unsigned MidCh,
@@ -1984,74 +2228,56 @@ private:
             }
         //if(shortest > 0) UI.PrintLn("shortest: %ld", shortest);
 
-        // Schedule the next playevent to be processed after that delay
-        for(size_t tk=0; tk<TrackCount; ++tk)
-            CurrentPosition.track[tk].delay -= shortest;
-
-        fraction<long> t = shortest * Tempo;
-        if(CurrentPosition.began) CurrentPosition.wait += t.valuel();
-
-        //if(shortest > 0) UI.PrintLn("Delay %ld (%g)", shortest, (double)t.valuel());
-
-        /*
-        if(CurrentPosition.track[0].ptr > 8119) loopEnd = true;
-        // ^HACK: CHRONO TRIGGER LOOP
-        */
-
         if(loopStart)
         {
             LoopBeginPosition = RowBeginPosition;
             LoopBeginSettings.assign(Ch.begin(), Ch.end());
+            LoopBeginTempo = Tempo;
+            loop_elapsed = 0;
             loopStart = false;
-        }
-        if(FolderPlayback && shortest < 0)
-        {
-            finished = true;
-            return;
         }
         if(shortest < 0 || (loopEnd && !FolderPlayback))
         {
-            // Loop if song end reached
-            loopEnd         = false;
+            loopEnd = false;
+            if(FolderPlayback || QuitWithoutLooping || loop_elapsed <= 0)
+            {
+                // A zero-duration loop cannot advance playback. Finish it
+                // instead of repeatedly replaying events at the same instant.
+                BeginEnding();
+                return;
+            }
+            ReleaseNotes();
             CurrentPosition = LoopBeginPosition;
-            shortest        = 0;
-
-            // Songs often end with notes still held, and with pitch bend,
-            // expression etc. wherever the ending left them. Release the
-            // notes and begin the next pass with the settings this one had.
-            for(unsigned MidCh = 0; MidCh < Ch.size(); ++MidCh)
-                NoteUpdate_All(MidCh, Upd_Off);
-            KillSustainingNotes();
-            for(std::size_t MidCh = 0; MidCh < Ch.size(); ++MidCh)
+            Tempo = LoopBeginTempo;
+            loop_elapsed = 0;
+            for(std::size_t MidCh=0; MidCh<Ch.size(); ++MidCh)
                 static_cast<MIDIchannelSettings&>(Ch[MidCh]) =
                     MidCh < LoopBeginSettings.size() ? LoopBeginSettings[MidCh]
-                                                     : MIDIchannelSettings(); // Channel added later
-
-            /* If the -nl commandline option was given, quit now */
-            if(QuitWithoutLooping)
-            {
-                QuitFlag = true;
-            }
+                                                     : MIDIchannelSettings();
+            return;
         }
+
+        for(size_t tk=0; tk<TrackCount; ++tk)
+            if(CurrentPosition.track[tk].status >= 0)
+                CurrentPosition.track[tk].delay -= shortest;
+        const double seconds = (shortest * Tempo).valuel();
+        CurrentPosition.wait += seconds;
+        loop_elapsed += seconds;
     }
     void HandleEvent(size_t tk)
     {
-        unsigned char byte = TrackData[tk][CurrentPosition.track[tk].ptr++];
+        Event event = ReadEvent(tk, CurrentPosition.track[tk].ptr, CurrentPosition.track[tk].status);
+        unsigned char byte = event.status;
         if(byte == 0xF7 || byte == 0xF0) // Ignore SysEx
         {
-            unsigned length = ReadVarLen(tk);
-            //std::string data( length?(const char*) &TrackData[tk][CurrentPosition.track[tk].ptr]:0, length );
-            CurrentPosition.track[tk].ptr += length;
-            UI.PrintLn("SysEx %02X: %u bytes", byte, length/*, data.c_str()*/);
+            UI.PrintLn("SysEx %02X: %zu bytes", byte, event.data.size());
             return;
         }
         if(byte == 0xFF)
         {
             // Special event FF
-            unsigned char evtype = TrackData[tk][CurrentPosition.track[tk].ptr++];
-            unsigned long length = ReadVarLen(tk);
-            std::string data( length?(const char*) &TrackData[tk][CurrentPosition.track[tk].ptr]:0, length );
-            CurrentPosition.track[tk].ptr += length;
+            unsigned char evtype = event.meta;
+            std::string data(event.data);
             if(evtype == 0x2F) { CurrentPosition.track[tk].status = -1; return; }
             if(evtype == 0x51) { Tempo = InvDeltaTicks * fraction<long>( (long) ReadBEint(data.data(), data.size())); return; }
             if(evtype == 6 && data == "loopStart") loopStart = true;
@@ -2067,18 +2293,13 @@ private:
                 if( (i&0xF0) == 0xC0 ) v |= 0x30;
                 //fprintf(stderr, "OPL poke %02X, %02X\n", i,v);
                 opl.Poke(0, i,v);
+                has_sound = true;
             }
             return;
         }
         // Any normal event (80..EF)
-        if(byte < 0x80)
-          { byte = CurrentPosition.track[tk].status | 0x80;
-            CurrentPosition.track[tk].ptr--; }
-        if(byte == 0xF3) { CurrentPosition.track[tk].ptr += 1; return; }
-        if(byte == 0xF2) { CurrentPosition.track[tk].ptr += 2; return; }
-        /*UI.PrintLn("@%X Track %u: %02X %02X",
-            CurrentPosition.track[tk].ptr-1, (unsigned)tk, byte,
-            TrackData[tk][CurrentPosition.track[tk].ptr]);*/
+        if(byte == 0xF3 || byte == 0xF2) return;
+        const auto* data = reinterpret_cast<const unsigned char*>(event.data.data());
         unsigned MidCh = byte & 0x0F, EvType = byte >> 4;
         MidCh += current_device[tk];
 
@@ -2090,8 +2311,8 @@ private:
             case 0x8: // Note off
             case 0x9: // Note on
             {
-                int note = TrackData[tk][CurrentPosition.track[tk].ptr++];
-                int  vol = TrackData[tk][CurrentPosition.track[tk].ptr++];
+                int note = *data++;
+                int  vol = *data++;
                 //if(MidCh != 9) note -= 12; // HACK for OpenGL video for changing octaves
                 if(CartoonersVolumes && vol != 0)
                 {
@@ -2259,13 +2480,14 @@ private:
                     ir.first->second.phys[ adlchannel[ccount] ] = i[ccount];
                 }
                 CurrentPosition.began  = true;
+                has_sound = true;
                 NoteUpdate(MidCh, ir.first, Upd_All | Upd_Patch);
                 break;
             }
             case 0xA: // Note touch
             {
-                int note = TrackData[tk][CurrentPosition.track[tk].ptr++];
-                int  vol = TrackData[tk][CurrentPosition.track[tk].ptr++];
+                int note = *data++;
+                int  vol = *data++;
                 auto i = Ch[MidCh].activenotes.find(note);
                 if(i == Ch[MidCh].activenotes.end())
                 {
@@ -2278,8 +2500,8 @@ private:
             }
             case 0xB: // Controller change
             {
-                int ctrlno = TrackData[tk][CurrentPosition.track[tk].ptr++];
-                int  value = TrackData[tk][CurrentPosition.track[tk].ptr++];
+                int ctrlno = *data++;
+                int  value = *data++;
                 switch(ctrlno)
                 {
                     case 1: // Adjust vibrato
@@ -2360,13 +2582,13 @@ private:
                 break;
             }
             case 0xC: // Patch change
-                Ch[MidCh].patch = TrackData[tk][CurrentPosition.track[tk].ptr++];
+                Ch[MidCh].patch = *data++;
                 UI.SetChannel(MidCh, Ch[MidCh].patch, track_names[tk]);
                 break;
             case 0xD: // Channel after-touch
             {
                 // TODO: Verify, is this correct action?
-                int  vol = TrackData[tk][CurrentPosition.track[tk].ptr++];
+                int  vol = *data++;
                 // Set this pressure to all active notes on the channel
                 for(auto& ch: Ch[MidCh].activenotes) { ch.second.vol = vol; }
                 NoteUpdate_All(MidCh, Upd_Volume);
@@ -2374,8 +2596,8 @@ private:
             }
             case 0xE: // Wheel/pitch bend
             {
-                int a = TrackData[tk][CurrentPosition.track[tk].ptr++];
-                int b = TrackData[tk][CurrentPosition.track[tk].ptr++];
+                int a = *data++;
+                int b = *data++;
                 Ch[MidCh].bend = (a + b*128 - 8192) * Ch[MidCh].bendsense;
                 NoteUpdate_All(MidCh, Upd_Pitch);
                 break;
@@ -2730,6 +2952,8 @@ public:
         std::map<std::string, unsigned>::iterator i = devices.find(name);
         if(i != devices.end()) return i->second;
         size_t n = devices.size() * 16;
+        if(n > std::numeric_limits<unsigned short>::max()-15u)
+            throw std::runtime_error("Too many MIDI devices");
         devices.insert( std::make_pair(name, n) );
         Ch.resize(n+16);
         return n;
@@ -2805,7 +3029,7 @@ struct Reverb /* This reverb implementation is based on Freeverb impl. in Sox */
         hf_damping = fhf_damping * .3 + .2;
         gain = std::exp(wet_gain_dB * (std::log(10.0) * 0.05)) * .015;
         input_fifo.insert(input_fifo.end(), delay, 0.f);
-        for(size_t i = 0; i <= std::ceil(depth); ++i)
+        for(size_t i = 0; i < 2; ++i)
         {
             chan[i].Create(sample_rate_Hz, scale, i * depth);
             out[i].resize(buffer_size);
@@ -2821,19 +3045,15 @@ struct Reverb /* This reverb implementation is based on Freeverb impl. in Sox */
         input_fifo.erase(input_fifo.begin(), input_fifo.begin() + length);
     }
 };
-static union ReverbSpecs
+static struct ReverbSettings
 {
-    float array[7];
-    struct byname
-    {
-        float do_reverb    = 1.0f; // boolean...
-        float wet_gain_db  = 24.0f; // Wet signal gain in dB
-        float room_scale   = 0.7f; // room_scale   (0..1)
-        float reverberance = 0.6f; // reverberance (0..1)
-        float hf_damping   = 0.8f; // hf_damping   (0..1)
-        float pre_delay_s  = 0.f;   // pre_delay_s  (0.. 0.5)
-        float stereo_depth = 1.f;   // stereo_depth (0..1)
-    } byname = {1.f, 24.f, .7f, .6f, .8f, 0.f, 1.f};
+    float do_reverb = 1.f;
+    float wet_gain_db = 24.f;
+    float room_scale = .7f;
+    float reverberance = .6f;
+    float hf_damping = .8f;
+    float pre_delay_s = 0.f;
+    float stereo_depth = 1.f;
 } ReverbSpecs;
 static struct MyReverbData
 {
@@ -2846,95 +3066,94 @@ static struct MyReverbData
     }
     void ReInit()
     {
-        enabled = ReverbSpecs.byname.do_reverb > 0;
+        enabled = ReverbSpecs.do_reverb > 0;
         for(std::size_t i=0; i<2; ++i)
         {
             chan[i] = Reverb();
             chan[i].Create(PCM_RATE,
-                ReverbSpecs.byname.wet_gain_db,
-                ReverbSpecs.byname.room_scale,
-                ReverbSpecs.byname.reverberance,
-                ReverbSpecs.byname.hf_damping,
-                ReverbSpecs.byname.pre_delay_s,
-                ReverbSpecs.byname.stereo_depth,
+                ReverbSpecs.wet_gain_db,
+                ReverbSpecs.room_scale,
+                ReverbSpecs.reverberance,
+                ReverbSpecs.hf_damping,
+                ReverbSpecs.pre_delay_s,
+                ReverbSpecs.stereo_depth,
                 MaxSamplesAtTime);
         }
     }
 } reverb_data;
 
-static void ParseReverb(std::string_view specs)
+static bool ParseNumber(const char* text, double minimum, double maximum, double& value)
 {
+    const char* first = (*text == '-' || *text == '+') ? text+1 : text;
+    if((*first < '0' || *first > '9') && *first != '.') return false;
+    char* end = nullptr;
+    errno = 0;
+    value = std::strtod(text, &end);
+    return end != text && !*end && errno != ERANGE
+        && value >= minimum && value <= maximum;
+}
+
+static bool ParseReverb(std::string_view specs)
+{
+    // Parse into a copy so a bad term never leaves partially applied settings.
+    auto next = ReverbSpecs;
+    if(specs.find_first_not_of(':') == specs.npos)
+    {
+        std::fprintf(stderr, "-reverb requires settings or 'none'.\n");
+        return false;
+    }
     while(!specs.empty())
     {
-        std::size_t colon = specs.find(':');
-        if(colon == 0)
+        const auto colon = specs.find(':');
+        const auto term = specs.substr(0, colon);
+        if(colon == specs.npos) specs = {}; else specs.remove_prefix(colon+1);
+        if(term.empty()) continue;
+        const auto eq = term.find('=');
+        const auto key = term.substr(0, eq);
+        if(key == "none" || key == "off" || key == "false" || key == "no" || key == "n")
         {
-            specs.remove_prefix(1);
+            if(eq != term.npos)
+            {
+                std::fprintf(stderr, "Reverb '%.*s' takes no value.\n", int(key.size()), key.data());
+                return false;
+            }
+            next.do_reverb = 0;
             continue;
         }
-        if(colon == specs.npos)
+        struct Setting { std::string_view names; float ReverbSettings::* field; double low, high; };
+        static const Setting settings[] = {
+            {"|gain|wet_gain|wetgain|wet|wet-gain|g|", &ReverbSettings::wet_gain_db, -60, 60},
+            {"|room|room_scale|scale|room-scale|roomscale|r|", &ReverbSettings::room_scale, 0, 1},
+            {"|factor|reverberance|reverb|amount|f|", &ReverbSettings::reverberance, 0, 1},
+            {"|hf|hf_damping|hf-damping|damping|dampening|damp|d|", &ReverbSettings::hf_damping, 0, 1},
+            {"|delay|pre_delay|pre-delay|predelay|wait|seconds|w|", &ReverbSettings::pre_delay_s, 0, .5},
+            {"|stereo|depth|stereo_depth|stereo-depth|stereodepth|width|wide|s|", &ReverbSettings::stereo_depth, 0, 1}
+        };
+        const Setting* setting = nullptr;
+        const std::string name = "|" + std::string(key) + "|";
+        if(key.find('|') == key.npos)
+            for(const auto& candidate: settings)
+                if(candidate.names.find(name) != candidate.names.npos) setting = &candidate;
+        if(!setting)
         {
-            colon = specs.size();
+            std::fprintf(stderr, "Unknown reverb setting: %.*s\n", int(key.size()), key.data());
+            return false;
         }
-        std::string_view term(&specs[0], colon);
-        if(!term.empty())
+        double value;
+        if(eq == term.npos || !ParseNumber(std::string(term.substr(eq+1)).c_str(),
+                                           setting->low, setting->high, value))
         {
-            std::size_t eq = specs.find('=');
-            std::size_t key_end     = (eq == specs.npos || eq >= term.size()) ? term.size() : eq;
-            std::size_t value_begin = (eq == specs.npos || eq >= term.size()) ? term.size() : (eq+1);
-            std::string_view key(&term[0], key_end);
-            float floatvalue = 0;
-            if(value_begin < term.size())
-            {
-                // Note: strtof requires nul-termination. Thus we use std::string instead of std::string_view
-                std::string value(&term[value_begin], term.size()-value_begin);
-                floatvalue = std::strtof(&value[0], nullptr);
-                //std::from_chars(&value[0], &value[value.size()], floatvalue); // Not implemented in GCC
-            }
-
-            // Create a hash of the key
-            //Good: start=0xF4939CE1DDA3,mul=0xE519FDFD45F8,add=0x9770000,perm=0x67EE6A00, mod=17,shift=32   distance = 7854  min=0 max=16
-            std::uint_fast64_t a=0xF4939CE1DDA3, b=0x67EE6A00, c=0x9770000, d=0xE519FDFD45F8, result=a + d*key.size();
-            constexpr unsigned mod=17, shift=32;
-            for(unsigned char ch: key)
-            {
-                result += ch;
-                result = (result ^ (result >> (1 + 1 * ((shift>>0) & 7)))) * b;
-                result = (result ^ (result >> (1 + 1 * ((shift>>3) & 7)))) * c;
-            }
-            unsigned index = result % mod;
-            // switch(index) {
-            // case 0: index = 0; break; // 0
-            // case 1: index = 3; break; // reverberance, reverb, amount, f
-            // case 2: index = 1; break; // g
-            // case 3: index = 2; break; // room_scale, scale, room-scale, roomscale
-            // case 4: index = 5; break; // delay, pre_delay, pre-delay, predelay, wait
-            // case 5: index = 4; break; // hf, hf_damping, hf-damping, damping, dampening, d
-            // case 6: index = 2; break; // r
-            // case 7: index = 0; break; // no, n
-            // case 8: index = 5; break; // seconds, w
-            // case 9: index = 6; break; // stereo
-            // case 10: index = 0; break; // none, false
-            // case 11: index = 4; break; // damp
-            // case 12: index = 2; break; // room
-            // case 13: index = 6; break; // depth, stereo_depth, stereo-depth, stereodepth, width, wide, s
-            // case 14: index = 0; break; // off
-            // case 15: index = 1; break; // gain, wet_gain, wetgain, wet, wet-gain
-            // case 16: index = 3; break; // factor
-            // }
-            index = (031062406502452130 >> (index * 3)) & 7;
-            /*if(index < 7)*/ ReverbSpecs.array[index] = floatvalue;
+            std::fprintf(stderr, "Reverb %.*s requires a number between %g and %g.\n",
+                int(key.size()), key.data(), setting->low, setting->high);
+            return false;
         }
-        specs.remove_prefix(colon);
+        next.*(setting->field) = value;
     }
+    ReverbSpecs = next;
     std::fprintf(stderr, "Reverb settings: Enabled=%g gain=%g room=%g reverb=%g damping=%g delay=%g stereo=%g\n",
-        ReverbSpecs.array[0],
-        ReverbSpecs.byname.wet_gain_db,
-        ReverbSpecs.byname.room_scale,
-        ReverbSpecs.byname.reverberance,
-        ReverbSpecs.byname.hf_damping,
-        ReverbSpecs.byname.pre_delay_s,
-        ReverbSpecs.byname.stereo_depth);
+        next.do_reverb, next.wet_gain_db, next.room_scale, next.reverberance,
+        next.hf_damping, next.pre_delay_s, next.stereo_depth);
+    return true;
 }
 
 #ifdef __WIN32__
@@ -3164,7 +3383,7 @@ static void SendStereoAudio(unsigned long count, int* samples)
     if(count > MaxSamplesAtTime)
     {
         SendStereoAudio(MaxSamplesAtTime, samples);
-        SendStereoAudio(count-MaxSamplesAtTime, samples+MaxSamplesAtTime);
+        SendStereoAudio(count-MaxSamplesAtTime, samples+MaxSamplesAtTime*2);
         return;
     }
 #if 0
@@ -3626,133 +3845,98 @@ int main(int argc, char** argv)
 
     std::srand(std::time(0));
 
-    while(argc > 2)
+    std::vector<const char*> positional;
+    for(int arg=2; arg<argc; ++arg)
     {
-        bool had_option = false;
-
-        if(!std::strcmp("-p", argv[2]))
-            AdlPercussionMode = true;
-        else if(!std::strcmp("-v", argv[2]))
-            HighVibratoMode = true;
-        else if(!std::strcmp("-t", argv[2]))
-            HighTremoloMode = true;
-        else if(!std::strcmp("-nl", argv[2]))
-            QuitWithoutLooping = true;
-        else if(!std::strcmp("-no-game", argv[2]))
-            ShowPuzzleGame = false;
-        else if(!std::strcmp("-game", argv[2]))
-            ShowPuzzleGame = true;
+        const std::string_view option = argv[arg];
+        if(option == "-p") AdlPercussionMode = true;
+        else if(option == "-v") HighVibratoMode = true;
+        else if(option == "-t") HighTremoloMode = true;
+        else if(option == "-nl") QuitWithoutLooping = true;
+        else if(option == "-no-game") ShowPuzzleGame = false;
+        else if(option == "-game") ShowPuzzleGame = true;
+        else if(option == "-s") ScaleModulators = true;
 #ifndef __DJGPP__
-        else if(!std::strcmp("-nr", argv[2]))
-            ParseReverb("none");
-        else if(!std::strcmp("-gain", argv[2]))
+        else if(option == "-nr") ParseReverb("none");
+        else if(option == "-gain")
         {
-            const char* value = argc > 3 ? argv[3] : "";
-            const char* first = (*value == '-' || *value == '+') ? value+1 : value;
-            char* end = nullptr;
-            double gain = std::strtod(value, &end);
-            if(((*first < '0' || *first > '9') && *first != '.')
-                || end == value || *end || gain < -60 || gain > 30)
+            if(arg+1 >= argc || !ParseNumber(argv[arg+1], -60, 30, OutputGainDb))
             {
                 std::fprintf(stderr, "-gain requires a number in dB between -60 and 30.\n");
                 return 1;
             }
-            OutputGainDb = gain;
-            had_option = true;
+            ++arg;
         }
-        else if(!std::strcmp("-reverb", argv[2]))
+        else if(option == "-reverb")
         {
-            ParseReverb(argv[3]);
-            had_option = true;
+            if(arg+1 >= argc)
+            {
+                std::fprintf(stderr, "-reverb requires settings or 'none'.\n");
+                return 1;
+            }
+            if(!ParseReverb(argv[++arg])) return 1;
         }
 #endif
-        else if(!std::strcmp("-w", argv[2]))
+        else if(option == "-w" || option == "-d")
         {
-            WritePCMfile = true;
-            if (argc > 3 && argv[3][0] != '\0' && (argv[3][0] != '-' || argv[3][1] == '\0'))
+            std::string* output = &PCMfilepath;
+            if(option == "-w") WritePCMfile = true;
+            else
             {
-                // Allow the option argument if
-                // - it's not empty, and...
-                // - it does not begin with "-" or it is "-"
-                // - it is not a positive integer
-                char* endptr = 0;
-                if(std::strtol(argv[3], &endptr, 10) < 0 || (endptr && *endptr))
-                {
-                    PCMfilepath = argv[3];
-                    had_option  = true;
-                }
-            }
-        }
-        else if(!std::strcmp("-d", argv[2]))
-        {
 #ifdef SUPPORT_VIDEO_OUTPUT
-            WriteVideoFile = true;
-            if (argc > 3 && argv[3][0] != '\0' && (argv[3][0] != '-' || argv[3][1] == '\0'))
-            {
-                char* endptr = 0;
-                if(std::strtol(argv[3], &endptr, 10) < 0 || (endptr && *endptr))
-                {
-                    VidFilepath = argv[3];
-                    had_option  = true;
-                }
-            }
+                WriteVideoFile = true;
+                output = &VidFilepath;
 #else
-            std::fprintf(stderr, "Video output not enabled at compilation time; -d option ignored\n");
+                std::fprintf(stderr, "Video output not enabled at compilation time.\n");
+                return 1;
 #endif
+            }
+            if(arg+1 < argc)
+            {
+                const std::string_view next = argv[arg+1];
+                // Preserve the optional output filename and positional bank syntax.
+                if(!next.empty() && (next.front() != '-' || next == "-")
+                    && next.find_first_not_of("0123456789") != next.npos)
+                    *output = argv[++arg];
+            }
         }
-        else if(!std::strcmp("-s", argv[2]))
-            ScaleModulators = true;
-        else break;
-
-        std::copy(argv + (had_option ? 4 : 3), argv + argc,
-                  argv+2);
-        argc -= (had_option ? 2 : 1);
-    }
-
-#ifndef __DJGPP__
-
-#ifndef __WIN32__
-    static SDL_AudioSpec spec, obtained;
-    spec.freq     = PCM_RATE;
-    spec.format   = AUDIO_S16SYS;
-    spec.channels = 2;
-    spec.samples  = spec.freq * AudioBufferLength;
-    spec.callback = AdlAudioCallback;
-    if (!WritePCMfile)
-    {
-        // Set up SDL
-        if(SDL_OpenAudio(&spec, &obtained) < 0)
+        else if(option.size() > 1 && option.front() == '-' && option != "-1")
         {
-            std::fprintf(stderr, "Couldn't open audio: %s\n", SDL_GetError());
-            //return 1;
+            std::fprintf(stderr, "Unknown option: %s\n", argv[arg]);
+            return 1;
         }
-        if(spec.samples != obtained.samples)
-            std::fprintf(stderr, "Wanted (samples=%u,rate=%u,channels=%u); obtained (samples=%u,rate=%u,channels=%u)\n",
-                spec.samples,    spec.freq,    spec.channels,
-                obtained.samples,obtained.freq,obtained.channels);
+        else positional.push_back(argv[arg]);
     }
-#endif
-
-#endif /* not DJGPP */
-
-    if(argc >= 3)
+    if(positional.size() > 3)
+    {
+        std::fprintf(stderr, "Expected at most bank, card count, and four-op count.\n");
+        return 1;
+    }
+    auto integer = [](const char* text, long low, long high, unsigned& result)
+    {
+        const char* first = (*text == '-' || *text == '+') ? text+1 : text;
+        if(*first < '0' || *first > '9') return false;
+        char* end = nullptr;
+        errno = 0;
+        long value = std::strtol(text, &end, 10);
+        if(errno == ERANGE || *end || value < low || value > high) return false;
+        result = value;
+        return true;
+    };
+    if(!positional.empty())
     {
         const unsigned NumBanks = sizeof(banknames)/sizeof(*banknames);
-        int bankno = std::atoi(argv[2]);
-        if(bankno == -1)
+        if(std::string_view(positional[0]) == "-1")
         {
-            bankno = 0;
+            AdlBank = 0;
             DoingInstrumentTesting = true;
         }
-        AdlBank = bankno;
-        if(AdlBank >= NumBanks)
+        else if(!integer(positional[0], 0, NumBanks-1, AdlBank))
         {
-            std::fprintf(stderr, "bank number may only be 0..%u.\n", NumBanks-1);
-            UI.ShowCursor();
-            return 0;
+            std::fprintf(stderr, "bank number must be an integer in 0..%u (or -1 for the tester).\n", NumBanks-1);
+            return 1;
         }
-        if(WritingToTTY)
-            UI.PrintLn("FM instrument bank %u selected.", AdlBank);
+        if(WritingToTTY) UI.PrintLn("FM instrument bank %u selected.", AdlBank);
     }
 
     unsigned n_fourop[2] = {0,0}, n_total[2] = {0,0};
@@ -3770,25 +3954,17 @@ int main(int argc, char** argv)
         UI.PrintLn("          and %u/%u percussive ones.", n_fourop[1], n_total[1]);
     }
 
-    if(argc >= 4)
+    if(positional.size() >= 2 && !integer(positional[1], 1, MaxCards, NumCards))
     {
-        NumCards = std::atoi(argv[3]);
-        if(NumCards < 1 || NumCards > MaxCards)
-        {
-            std::fprintf(stderr, "number of cards may only be 1..%u.\n", MaxCards);
-            UI.ShowCursor();
-            return 0;
-        }
+        std::fprintf(stderr, "number of cards must be an integer in 1..%u.\n", MaxCards);
+        return 1;
     }
-    if(argc >= 5)
+    if(positional.size() >= 3)
     {
-        NumFourOps = std::atoi(argv[4]);
-        if(NumFourOps > 6 * NumCards)
+        if(!integer(positional[2], 0, 6*NumCards, NumFourOps))
         {
-            std::fprintf(stderr, "number of four-op channels may only be 0..%u when %u OPL3 cards are used.\n",
-                6*NumCards, NumCards);
-            UI.ShowCursor();
-            return 0;
+            std::fprintf(stderr, "number of four-op channels must be an integer in 0..%u.\n", 6*NumCards);
+            return 1;
         }
     }
     else
@@ -3851,11 +4027,16 @@ int main(int argc, char** argv)
 
     MIDIplay player;
     std::size_t current_track = 0;
+    const unsigned selected_bank = AdlBank;
+    const bool selected_logarithmic_volumes = LogarithmicVolumes;
     // Construct a fresh player for each file, including failed load attempts.
     auto load_track = [&](int direction)
     {
         for(std::size_t attempts=0; attempts<playlist.size(); ++attempts)
         {
+            AdlBank = selected_bank;
+            LogarithmicVolumes = selected_logarithmic_volumes;
+            CartoonersVolumes = false;
             MIDIplay next;
             next.ChooseDevice("");
             if(next.LoadMIDI(playlist[current_track].string()))
@@ -3888,7 +4069,7 @@ int main(int argc, char** argv)
             "ERROR: You have selected a bank that consists almost exclusively of four-op patches.\n"
             "       The results (silence + much cpu load) would be probably\n"
             "       not what you want, therefore ignoring the request.\n");
-        return 0;
+        return 1;
     }
 
 #ifndef __DJGPP__
@@ -3897,6 +4078,35 @@ int main(int argc, char** argv)
         std::perror(PCMfilepath.c_str());
         UI.ShowCursor();
         return 2;
+    }
+#endif
+
+#if !defined(__DJGPP__) && !defined(__WIN32__)
+    SDL_AudioSpec spec{}, obtained{};
+    spec.freq = PCM_RATE;
+    spec.format = AUDIO_S16SYS;
+    spec.channels = 2;
+    spec.samples = spec.freq * AudioBufferLength;
+    spec.callback = AdlAudioCallback;
+    if(!WritePCMfile)
+    {
+        if(SDL_Init(SDL_INIT_AUDIO) < 0)
+        {
+            std::fprintf(stderr, "Couldn't initialize audio: %s\n", SDL_GetError());
+            return 1;
+        }
+        std::atexit(SDL_Quit);
+        if(SDL_OpenAudio(&spec, &obtained) < 0)
+        {
+            std::fprintf(stderr, "Couldn't open audio: %s\n", SDL_GetError());
+            return 1;
+        }
+        if(obtained.freq != spec.freq || obtained.format != spec.format || obtained.channels != spec.channels)
+        {
+            std::fprintf(stderr, "Audio device does not support 48 kHz, 16-bit stereo playback.\n");
+            SDL_CloseAudio();
+            return 1;
+        }
     }
 #endif
 
@@ -3933,15 +4143,27 @@ int main(int argc, char** argv)
 
     UI.TetrisLaunched = true;
     double carry = 0.0;
+    bool natural_completion = false;
+    int exit_status = 0;
     for(double delay=0; !QuitFlag; )
     {
         if(!DoingInstrumentTesting && Input.StopRequested()) break;
+        if(!DoingInstrumentTesting && !FolderPlayback && player.finished)
+        {
+            natural_completion = true;
+            exit_status = player.failed ? 2 : 0;
+            break;
+        }
         if(FolderPlayback && (TrackChange || player.finished))
         {
             bool automatic = !TrackChange;
             int direction = TrackChange ? TrackChange : 1;
             TrackChange = 0;
-            if(automatic && QuitWithoutLooping && current_track+1 == playlist.size()) break;
+            if(automatic && QuitWithoutLooping && current_track+1 == playlist.size())
+            {
+                natural_completion = true;
+                break;
+            }
             current_track = direction < 0 ? (current_track+playlist.size()-1)%playlist.size()
                                           : (current_track+1)%playlist.size();
 #ifndef __DJGPP__
@@ -3956,7 +4178,11 @@ int main(int argc, char** argv)
             std::fill_n(PreviousAudioInput, 2, 0.f);
             std::fill_n(PreviousAudioOutput, 2, 0.f);
 #endif
-            if(!load_track(direction)) break;
+            if(!load_track(direction))
+            {
+                natural_completion = automatic;
+                break;
+            }
             delay = 0;
             carry = 0;
             SkipForward = 0;
@@ -4082,8 +4308,26 @@ int main(int argc, char** argv)
 #else
     if(!WritePCMfile)
     {
-        StopFadeRemaining.store(StopFadeFrames);
-        AudioStopping.store(true);
+        if(natural_completion)
+        {
+            // Finish queued audio on natural completion. Keep cancellation
+            // responsive and bound the wait if a device stops calling back.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            std::unique_lock lock(AudioBuffer_lock);
+            while(!AudioBuffer.empty() && !QuitFlag && std::chrono::steady_clock::now() < deadline)
+            {
+                AudioBuffer_drained.wait_for(lock, std::chrono::milliseconds(20));
+                lock.unlock();
+                if(Input.StopRequested()) QuitFlag = true;
+                lock.lock();
+            }
+            natural_completion = AudioBuffer.empty() && !QuitFlag;
+        }
+        if(!natural_completion)
+        {
+            StopFadeRemaining.store(StopFadeFrames);
+            AudioStopping.store(true);
+        }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
         while(StopFadeRemaining.load() && std::chrono::steady_clock::now() < deadline)
             SDL_Delay(1);
@@ -4106,5 +4350,5 @@ int main(int argc, char** argv)
             ""
         );
     }
-    return 0;
+    return exit_status;
 }
