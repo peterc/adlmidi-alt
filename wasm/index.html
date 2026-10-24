@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#191a1d">
+  <title>ADLMIDI-ALT-WEB</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="assets/fonts/WebPlus_IBM_VGA_8x16.woff" as="font" type="font/woff" crossorigin>
+  <link rel="stylesheet" href="style.css?v=18">
+</head>
+<body>
+<main class="workspace">
+  <div class="panel-stack">
+  <section class="panel player" aria-label="MIDI player">
+    <div class="panel-title"><h1>ADLMIDI-ALT-WEB</h1><span id="status" role="status">Loading…</span></div>
+    <div class="panel-body">
+      <div class="song-line"><h2 id="song-title">Loading…</h2><span id="song-detail">Demo</span></div>
+      <div class="dropzone" id="dropzone"><label class="file-button" for="file">Open MIDI</label><input class="visually-hidden" id="file" type="file" multiple accept=".mid,.midi,.rmi,audio/midi,audio/x-midi"><label class="file-button" for="folder">Open folder</label><input class="visually-hidden" id="folder" type="file" webkitdirectory multiple><button id="open-url" aria-expanded="false" aria-controls="url-form">Open URL</button><span class="drop-hint">or drop anywhere</span></div>
+      <form id="url-form" class="url-form" hidden>
+        <label class="visually-hidden" for="midi-url">MIDI URL</label>
+        <input id="midi-url" type="url" placeholder="https://…/song.mid" required spellcheck="false" autocomplete="off">
+        <button id="load-url" type="submit">Open</button>
+        <button id="close-url" type="button" aria-label="Close URL entry">×</button>
+      </form>
+      <div class="scope-wrap"><canvas id="scope" aria-label="Live stereo audio waveform"></canvas><span class="scope-label" id="sample-rate">48 kHz · Stereo</span></div>
+      <div class="timeline"><div class="progress" role="progressbar" aria-label="Playback progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-fill"></div></div><div class="time-labels"><span id="elapsed">0:00</span><span class="musical-info"><span id="bpm" title="Current tempo in quarter notes per minute"></span><span id="time-signature" title="Current time signature" hidden></span></span><span id="duration">0:00</span></div></div>
+      <div class="transport"><div class="transport-buttons"><button id="previous" aria-label="Previous track" title="Previous track" disabled>◀</button><button id="play" disabled>▶ <span>Play</span></button><button id="stop" aria-label="Stop and rewind" disabled>■ <span>Stop</span></button><button id="next" aria-label="Next track" title="Next track" disabled>▶</button></div><label class="toggle" title="Repeat the current track"><input type="checkbox" id="loop"><span>Loop</span></label></div>
+      <div id="error" class="error" role="alert" hidden></div>
+      <details class="file-info" id="file-info" open>
+        <summary>File info</summary>
+        <div class="file-info-content">
+          <dl class="file-metadata">
+            <div class="metadata-row" id="title-row" hidden><dt>Title</dt><dd id="file-title"></dd></div>
+            <div class="metadata-row" id="copyright-row" hidden><dt>Copyright</dt><dd id="file-copyright"></dd></div>
+          </dl>
+          <table class="track-table"><thead><tr><th scope="col">Track</th><th scope="col">Instruments</th></tr></thead><tbody id="track-list"></tbody></table>
+        </div>
+      </details>
+    </div>
+  </section>
+  <section class="panel playlist" aria-labelledby="playlist-title">
+    <div class="panel-title"><h2 id="playlist-title">Playlist</h2><span id="playlist-count">0 tracks</span></div>
+    <ol id="playlist-list" class="playlist-list" aria-label="Tracks"></ol>
+  </section>
+  </div>
+  <div class="panel-stack sound-stack">
+  <section class="panel sound-settings" aria-label="Sound settings">
+    <div class="panel-title"><h2>Settings</h2><button id="reset-settings" title="Restore sound settings to defaults">Reset</button></div>
+    <div class="panel-body">
+      <div class="settings">
+        <label for="bank">Bank</label><select id="bank" title="Changing bank restarts playback"><option value="1">1 · Bisqwit</option></select>
+        <label for="cards">OPL3 cards</label><select id="cards" title="Changing card count restarts playback"><option value="1">1 card</option><option value="2">2 cards</option><option value="4" selected>4 cards</option><option value="8">8 cards</option><option value="16">16 cards</option></select>
+        <label for="gain">Gain</label><div class="slider-field"><input id="gain" type="range" min="-24" max="24" value="12" step="1"><output id="gain-value" for="gain">+12 dB</output></div>
+      </div>
+      <div id="voices">16 four-op / 40 two-op voices</div>
+      <div class="section-caption">Synthesis</div>
+      <div class="synth-options" title="Changing synthesis options restarts playback">
+        <label class="toggle" title="Stronger tremolo for instruments that use it; restarts playback"><input type="checkbox" id="tremolo">Deep tremolo</label>
+        <label class="toggle" title="Stronger vibrato for instruments that use it; restarts playback"><input type="checkbox" id="vibrato">Deep vibrato</label>
+        <label class="toggle" title="Scale FM modulator levels with note volume; restarts playback"><input type="checkbox" id="modulators">Scale modulators</label>
+      </div>
+      <div class="section-caption"><label class="toggle"><input type="checkbox" id="reverb" checked>Reverb</label></div>
+      <details class="reverb-details">
+        <summary>Reverb settings</summary>
+      <div class="settings reverb-settings">
+        <label for="wet">Wet gain</label><div class="slider-field"><input id="wet" type="range" min="0" max="36" value="24" step="1"><output id="wet-value" for="wet">+24 dB</output></div>
+        <label for="room">Room size</label><div class="slider-field"><input id="room" type="range" min="0" max="100" value="70" step="1"><output id="room-value" for="room">70%</output></div>
+        <label for="decay">Decay</label><div class="slider-field"><input id="decay" type="range" min="0" max="100" value="60" step="1"><output id="decay-value" for="decay">60%</output></div>
+        <label for="damping">HF damping</label><div class="slider-field"><input id="damping" type="range" min="0" max="100" value="80" step="1"><output id="damping-value" for="damping">80%</output></div>
+        <label for="predelay">Pre-delay</label><div class="slider-field"><input id="predelay" type="range" min="0" max="500" value="0" step="5"><output id="predelay-value" for="predelay">0 ms</output></div>
+        <label for="stereo">Stereo width</label><div class="slider-field"><input id="stereo" type="range" min="0" max="100" value="100" step="1"><output id="stereo-value" for="stereo">100%</output></div>
+      </div>
+      </details>
+    </div>
+  </section>
+  <div class="panel-stack monitor-stack">
+  <section class="panel activity" aria-label="MIDI channel activity">
+    <div class="panel-title"><h2>MIDI channels</h2></div>
+    <div class="channel-heading" aria-hidden="true"><span>CH</span><span>Instrument</span><span>Level</span></div>
+    <div id="channels" class="channels"></div>
+  </section>
+  <section class="panel credits" aria-labelledby="credits-title">
+    <div class="panel-title"><h2 id="credits-title">Credits</h2></div>
+    <div class="panel-body">
+      <p><a href="https://github.com/bisqwit/adlmidi" target="_blank" rel="noopener noreferrer">ADLMIDI</a><br>Original project by Joel Yliluoma (Bisqwit).</p>
+      <p><a href="https://github.com/peterc/adlmidi-alt" target="_blank" rel="noopener noreferrer">adlmidi-alt</a><br>Fork by Peter Cooper.<br>Engine and web app: <a href="LICENSE-GPL-3.0.txt" target="_blank" rel="noopener noreferrer">GPL v3</a>.</p>
+      <p>IBM VGA 8×16 (WebPlus) font by <a href="https://int10h.org/oldschool-pc-fonts/" target="_blank" rel="noopener noreferrer">VileR</a>.<br><a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener noreferrer">CC BY-SA 4.0</a> · Used unmodified.</p>
+    </div>
+  </section>
+  </div>
+  </div>
+</main>
+<script type="module" src="app.mjs?v=17"></script>
+</body>
+</html>

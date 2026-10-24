@@ -1,0 +1,33 @@
+{
+  "checkoutCommit": "9efd5c31389473f07de4bdd7e61319bce65e8cf8",
+  "files": {
+    "midiplay.cc": {
+      "source": "src/midiplay.cc",
+      "sha256": "71155246faa000ac384cb655d4fe3e994c2b45bcd8399308273420719c819108"
+    },
+    "dbopl.cpp": {
+      "source": "src/dbopl.cpp",
+      "sha256": "8097687a74401fe8f13a55af80cda6c3bb03571149abdbd657c2abcb30e054c7"
+    },
+    "dbopl.h": {
+      "source": "src/dbopl.h",
+      "sha256": "d9c90a66d4f7474f51b5673a28cc02f7d0361854dc4e9595ffba7bad49f94ed1"
+    },
+    "adldata.cc": {
+      "source": "src/adldata.cc",
+      "sha256": "9686989df7e9eb9b3fc32cbe1860e0dd386609a302a46c88c5d21b23eb54f850"
+    },
+    "adldata.hh": {
+      "source": "src/adldata.hh",
+      "sha256": "c0883f7a2064f9a297d6bfb6990507583eaaa6d3308a855158e73703e3707c95"
+    },
+    "fraction": {
+      "source": "src/fraction",
+      "sha256": "6919fc604feca46323df735aaa0f603061d5af68da323b407256c83fd20f8a0c"
+    },
+    "UPSTREAM-README.md": {
+      "source": "README.md",
+      "sha256": "56260db44b37867339e58ad839d4a24e7e2e55e0002fc878f131690d2b7a0797"
+    }
+  }
+}
